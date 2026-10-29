@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Guardrail Comparison for Teams</title>
+</head>
+<body style="font-family:Arial,Helvetica,sans-serif;color:#202124;">
+  <h2 style="font-size:18px;">Guardrail Framework Comparison</h2>
+  <p>Shortlist for a banking chatbot. Verify current pricing and terms before procurement.</p>
+  <table cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;font:12px/1.3 Arial,Helvetica,sans-serif;">
+    <thead>
+      <tr>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:6px;text-align:left;">Framework / provider</th>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:6px;text-align:left;">License / cost</th>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:6px;text-align:left;">Model-specific?</th>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:6px;text-align:left;">PII / security coverage</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td style="border:1px solid #c3ccd3;padding:6px;"><a href="https://github.com/NVIDIA-NeMo/Guardrails">NeMo Guardrails (NVIDIA)</a></td><td style="border:1px solid #c3ccd3;padding:6px;">Apache 2.0; free software</td><td style="border:1px solid #c3ccd3;padding:6px;">No; supports multiple LLMs</td><td style="border:1px solid #c3ccd3;padding:6px;">PII masking rails via configured detector; input, output, dialog and tool rails</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;"><a href="https://github.com/guardrails-ai/guardrails">Guardrails AI</a></td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Apache 2.0 core; DetectPII MIT</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">No; model-agnostic</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">PII anonymization via Presidio; schemas and custom validators</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;padding:6px;"><a href="https://pangea.cloud/docs/ai-guard/">Pangea AI Guard</a></td><td style="border:1px solid #c3ccd3;padding:6px;">Commercial; free evaluation</td><td style="border:1px solid #c3ccd3;padding:6px;">No; model-agnostic API</td><td style="border:1px solid #c3ccd3;padding:6px;">PII redaction, prompt-injection and secrets screening</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;"><a href="https://docs.lakera.ai/docs/defenses">Check Point AI Guardrails</a></td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Commercial</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">No; model-agnostic screening</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Prompt attacks, data leakage and agent/tool policies; verify redaction</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;padding:6px;"><a href="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html">Amazon Bedrock Guardrails</a></td><td style="border:1px solid #c3ccd3;padding:6px;">Managed; usage-based</td><td style="border:1px solid #c3ccd3;padding:6px;">AWS service; check model/region support</td><td style="border:1px solid #c3ccd3;padding:6px;">Can mask/block PII; content, topic and prompt-attack filters</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;"><a href="https://cloud.google.com/security/products/model-armor">Google Model Armor</a></td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Managed; usage charges after free allowance</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">No; model/cloud-agnostic API</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Prompt attacks and sensitive-data screening; confirm redaction setup</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;padding:6px;"><a href="https://learn.microsoft.com/en-us/azure/ai-services/content-safety/overview">Azure AI Content Safety</a></td><td style="border:1px solid #c3ccd3;padding:6px;">Managed Azure service</td><td style="border:1px solid #c3ccd3;padding:6px;">No; model-independent API</td><td style="border:1px solid #c3ccd3;padding:6px;">Content and prompt safety; no complete PII masking by itself</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;"><a href="https://github.com/meta-llama/PurpleLlama/tree/main/LlamaFirewall">LlamaFirewall (Meta)</a></td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Open-source code</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Scans different LLM workflows; some scanners use specific models</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Prompt/agent security; experimental PII scanner detects but does not redact</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;padding:6px;"><a href="https://github.com/ibm-granite/granite-guardian">Granite Guardian (IBM)</a></td><td style="border:1px solid #c3ccd3;padding:6px;">Apache 2.0 model</td><td style="border:1px solid #c3ccd3;padding:6px;">Uses IBM Granite judge model</td><td style="border:1px solid #c3ccd3;padding:6px;">Jailbreak, grounding and tool-call risk; no PII masking</td></tr>
+      <tr><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;"><a href="https://github.com/protectai/llm-guard">LLM Guard (Protect AI)</a></td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">MIT; archived in 2026</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Target-model agnostic</td><td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:6px;">Historically had anonymization and scanners; not recommended for new projects</td></tr>
+    </tbody>
+  </table>
+  <p style="font-size:12px;"><strong>Shortlist:</strong> NeMo Guardrails for open source; evaluate Pangea, Check Point, or Google for managed screening. Backend authorization, MFA, transfer validation, idempotency, and audit logging remain mandatory.</p>
+</body>
+</html>

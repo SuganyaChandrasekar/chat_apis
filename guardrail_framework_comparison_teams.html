@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Guardrail Framework Comparison</title>
+  <style>
+    body { margin: 24px; color: #202124; font: 14px/1.45 "Segoe UI", sans-serif; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p { max-width: 960px; margin: 0 0 16px; color: #444; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #b8c2cc; padding: 9px 10px; text-align: left; vertical-align: top; }
+    th { background: #e8eef2; font-weight: 600; }
+    tr:nth-child(even) td { background: #f7f9fa; }
+    a { color: #075985; }
+    .note { margin-top: 14px; font-size: 13px; }
+    @media print { body { margin: 0; } table { font-size: 11px; } }
+  </style>
+</head>
+<body>
+  <h1>Guardrail Framework Comparison</h1>
+  <p>Practical shortlist for a banking chatbot. “Model-agnostic” means it can screen traffic for different target models; individual detectors may still use their own models or services.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Framework / provider</th>
+        <th>License or cost</th>
+        <th>Model dependence</th>
+        <th>PII masking</th>
+        <th>Other coverage and banking fit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a href="https://github.com/NVIDIA-NeMo/Guardrails">NeMo Guardrails</a><br>NVIDIA</td>
+        <td>Open source, Apache 2.0. Hosting and external model costs are separate.</td>
+        <td>Supports multiple LLM providers; some screening integrations use separate models/services.</td>
+        <td>Configurable detection and masking rails. Review detector dependencies, such as Presidio/GLiNER.</td>
+        <td>Input, output, retrieval, dialog, and tool rails; topics, jailbreaks, moderation, hallucination, custom flows. Strong open-source candidate; validate fail-closed behavior and Gemini/LangGraph integration.</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/guardrails-ai/guardrails">Guardrails AI</a><br>Guardrails AI</td>
+        <td>Open-source Apache 2.0 core; DetectPII validator MIT. Hosting/model costs are separate.</td>
+        <td>Model-agnostic validator framework.</td>
+        <td>DetectPII can anonymize locally using Presidio.</td>
+        <td>Input/output and custom validators, structured-output checks, correction/reask. Good developer framework, not a complete agent-security platform; PII masking uses Presidio underneath.</td>
+      </tr>
+      <tr>
+        <td><a href="https://pangea.cloud/docs/ai-guard/">Pangea AI Guard</a><br>Pangea</td>
+        <td>Commercial; free account for evaluation. SaaS, Edge, and Private Cloud options; production pricing varies.</td>
+        <td>Model-agnostic API.</td>
+        <td>Recipes can redact/replace PII in prompts and responses.</td>
+        <td>Prompt-injection blocking, secrets and malicious-content detectors, configurable policies, audit reporting. Closest managed fit for sanitized content plus screening; review private processing, retention, region, and contract.</td>
+      </tr>
+      <tr>
+        <td><a href="https://docs.lakera.ai/docs/defenses">Check Point AI Guardrails (Lakera)</a><br>Check Point</td>
+        <td>Commercial; SaaS and self-hosted-container options. Contact vendor for production pricing.</td>
+        <td>Model-agnostic screening layer.</td>
+        <td>Data-leakage prevention includes PII protection; confirm exact redaction action.</td>
+        <td>Prompt-attack defense, moderation, malicious-link detection, agent behavior defense, tool allow/deny. Strong enterprise candidate; verify data boundary and redaction behavior.</td>
+      </tr>
+      <tr>
+        <td><a href="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html">Amazon Bedrock Guardrails</a><br>AWS</td>
+        <td>Managed, usage-based service; not open source.</td>
+        <td>AWS-managed; supports Bedrock and an ApplyGuardrail API. Check model/region support.</td>
+        <td>Can block or mask PII/sensitive entities and custom regex patterns.</td>
+        <td>Content/topic/word filters, prompt-attack filters, contextual grounding, automated reasoning. Strong if AWS is acceptable; review cost and data boundary.</td>
+      </tr>
+      <tr>
+        <td><a href="https://cloud.google.com/security/products/model-armor">Google Cloud Model Armor</a><br>Google</td>
+        <td>Managed; product page lists 2M tokens/month free, then $0.10 per additional million tokens. Verify current terms.</td>
+        <td>Model- and cloud-agnostic REST API; also integrates with Google services.</td>
+        <td>Integrates Sensitive Data Protection; confirm required redaction behavior and configuration.</td>
+        <td>Prompt-injection/jailbreak screening, sensitive-data leakage, harmful content, malware, unsafe URLs. Worth evaluating with Gemini; confirm data residency and additional charges.</td>
+      </tr>
+      <tr>
+        <td><a href="https://learn.microsoft.com/en-us/azure/ai-services/content-safety/overview">Azure AI Content Safety</a><br>Microsoft</td>
+        <td>Managed Azure service; limited F0 tier and paid S0 tier.</td>
+        <td>Screening API is not tied to one model provider.</td>
+        <td>No complete PII masking pipeline by itself; requires another service or custom component.</td>
+        <td>Content moderation, Prompt Shields, groundedness, task adherence, protected-material detection. Partial fit if PII masking is mandatory.</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/meta-llama/PurpleLlama/tree/main/LlamaFirewall">LlamaFirewall</a><br>Meta</td>
+        <td>Open-source code; scanner/model assets may have separate terms or costs.</td>
+        <td>Can scan different target LLM workflows; some scanners depend on specific models/services.</td>
+        <td>Experimental PII scanner detects/blocks; it does not redact text.</td>
+        <td>Prompt-injection, agent-trace/alignment, regex/custom scanning, code security. Useful supplementary scanner, not a PII masker.</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/ibm-granite/granite-guardian">Granite Guardian</a><br>IBM</td>
+        <td>Models Apache 2.0; local hosting requires compute.</td>
+        <td>Judge model is IBM Granite; can assess prompts/responses/tool calls from other agents.</td>
+        <td>No built-in PII masking; custom criteria can judge whether text contains sensitive data.</td>
+        <td>Jailbreak/harm, RAG groundedness/relevance, tool-call hallucination, custom criteria. Useful local risk detector, not a complete guardrail framework or masker.</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/protectai/llm-guard">LLM Guard</a><br>Protect AI</td>
+        <td>MIT, but repository archived July 9, 2026 and no longer maintained.</td>
+        <td>Model-agnostic pipeline; some scanners use separate models.</td>
+        <td>Historically included input anonymization.</td>
+        <td>Prompt injection, secrets, toxicity, sanitization, and output scanners. Not recommended for new production banking systems because it is archived.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="note"><strong>Shortlist:</strong> NeMo Guardrails for an open-source framework; Pangea AI Guard for a managed sanitize-and-screen service; also evaluate Check Point AI Guardrails and Google Model Armor. No guardrail product replaces backend account authorization, MFA, transfer validation, idempotency, or audit logging. Verify licensing, pricing, supported regions, data retention, and redaction behavior with each provider before procurement.</p>
+</body>
+</html>

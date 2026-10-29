@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Guardrail Framework Comparison</title>
+</head>
+<body style="margin:0;padding:16px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.4;color:#202124;">
+  <h2 style="margin:0 0 8px;font-size:20px;color:#17324d;">Guardrail Framework Comparison</h2>
+  <p style="margin:0 0 14px;">Practical shortlist for a banking chatbot. “Model-agnostic” means the guardrail can screen traffic for different target models; individual detectors may still use their own models or services.</p>
+  <table cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.35;">
+    <thead>
+      <tr>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:8px;text-align:left;vertical-align:top;">Framework / provider</th>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:8px;text-align:left;vertical-align:top;">License / cost</th>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:8px;text-align:left;vertical-align:top;">Model-specific?</th>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:8px;text-align:left;vertical-align:top;">PII masking</th>
+        <th style="border:1px solid #9aa8b4;background:#e8eef2;padding:8px;text-align:left;vertical-align:top;">Coverage and banking fit</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;"><a href="https://github.com/NVIDIA-NeMo/Guardrails" style="color:#075985;">NeMo Guardrails</a><br>NVIDIA</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Open source, Apache 2.0. Hosting and external model costs are separate.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Supports multiple LLM providers; some screening integrations use separate models or services.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Configurable detection and masking rails. Review detector dependencies such as Presidio or GLiNER.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Input, output, retrieval, dialog, and tool rails; topics, jailbreaks, moderation, hallucination, and custom flows. Strong open-source candidate; validate fail-closed behavior and Gemini/LangGraph integration.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;"><a href="https://github.com/guardrails-ai/guardrails" style="color:#075985;">Guardrails AI</a><br>Guardrails AI</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Open-source Apache 2.0 core; DetectPII validator MIT. Hosting/model costs are separate.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Model-agnostic validator framework.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">DetectPII can anonymize locally using Presidio.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Input/output and custom validators, structured-output checks, correction/reask. Good developer framework, not a full agent-security platform; PII masking uses Presidio underneath.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;"><a href="https://pangea.cloud/docs/ai-guard/" style="color:#075985;">Pangea AI Guard</a><br>Pangea</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Commercial; free account for evaluation. SaaS, Edge, and Private Cloud options; production pricing varies.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Model-agnostic API.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Recipes can redact/replace PII in prompts and responses.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Prompt-injection blocking, secrets and malicious-content detectors, configurable policies, audit reporting. Closest managed fit for sanitized content plus screening; review private processing, retention, region, and contract.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;"><a href="https://docs.lakera.ai/docs/defenses" style="color:#075985;">Check Point AI Guardrails (Lakera)</a><br>Check Point</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Commercial; SaaS and self-hosted-container options. Contact vendor for production pricing.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Model-agnostic screening layer.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Data-leakage prevention includes PII protection; confirm exact redaction action.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Prompt-attack defense, moderation, malicious-link detection, agent behavior defense, and tool allow/deny. Verify data boundary and redaction behavior.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;"><a href="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html" style="color:#075985;">Amazon Bedrock Guardrails</a><br>AWS</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Managed, usage-based service; not open source.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">AWS-managed; supports Bedrock and an ApplyGuardrail API. Check model and region support.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Can block or mask PII/sensitive entities and custom regex patterns.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Content, topic, word, prompt-attack, grounding, and automated-reasoning checks. Strong if AWS is acceptable; review cost and data boundary.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;"><a href="https://cloud.google.com/security/products/model-armor" style="color:#075985;">Google Cloud Model Armor</a><br>Google</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Managed; product page lists a free monthly token allowance, then usage charges. Verify current pricing.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Model- and cloud-agnostic REST API; also integrates with Google services.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Integrates Sensitive Data Protection; confirm required redaction behavior and configuration.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Prompt-injection/jailbreak screening, sensitive-data leakage, harmful content, malware, and unsafe URLs. Worth evaluating with Gemini; confirm data residency and costs.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;"><a href="https://learn.microsoft.com/en-us/azure/ai-services/content-safety/overview" style="color:#075985;">Azure AI Content Safety</a><br>Microsoft</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Managed Azure service; limited free tier and paid tier.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Screening API is not tied to one model provider.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">No complete PII masking pipeline by itself; requires another service or custom component.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Content moderation, Prompt Shields, groundedness, task adherence, and protected-material detection. Partial fit if PII masking is mandatory.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;"><a href="https://github.com/meta-llama/PurpleLlama/tree/main/LlamaFirewall" style="color:#075985;">LlamaFirewall</a><br>Meta</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Open-source code; scanner/model assets may have separate terms or costs.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Scans different target LLM workflows; some scanners use specific models/services.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Experimental PII scanner detects/blocks; it does not redact text.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Prompt-injection, agent-trace/alignment, regex/custom scanning, and code security. Useful supplementary scanner, not a PII masker.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;"><a href="https://github.com/ibm-granite/granite-guardian" style="color:#075985;">Granite Guardian</a><br>IBM</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Models Apache 2.0; local hosting requires compute.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Uses IBM Granite judge model; can assess prompts/responses/tool calls from other agents.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">No built-in PII masking pipeline; custom criteria can judge sensitive-data presence.</td>
+        <td style="border:1px solid #c3ccd3;padding:8px;vertical-align:top;">Jailbreak/harm, RAG groundedness/relevance, tool-call hallucination, and custom criteria. Useful local risk detector, not a complete framework or masker.</td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;"><a href="https://github.com/protectai/llm-guard" style="color:#075985;">LLM Guard</a><br>Protect AI</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">MIT, but repository archived in 2026 and no longer maintained.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Target-model agnostic; some scanners use separate models.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Historically included input anonymization.</td>
+        <td style="border:1px solid #c3ccd3;background:#f7f9fa;padding:8px;vertical-align:top;">Prompt injection, secrets, toxicity, sanitization, and output scanners. Not recommended for a new production banking system.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p style="margin:14px 0 0;font-size:12px;"><strong>Shortlist:</strong> NeMo Guardrails for an open-source framework; Pangea AI Guard for a managed sanitize-and-screen service; also evaluate Check Point AI Guardrails and Google Model Armor. No guardrail replaces backend account authorization, MFA, transfer validation, idempotency, or audit logging. Verify current licensing, pricing, regions, retention, and redaction behavior before procurement.</p>
+</body>
+</html>

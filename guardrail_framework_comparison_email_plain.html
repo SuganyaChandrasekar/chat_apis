@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Guardrail Framework Comparison</title>
+</head>
+<body style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.4;">
+  <h2>Guardrail Framework Comparison</h2>
+  <p>Shortlist for a banking chatbot. Verify current pricing and terms before procurement.</p>
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.35;">
+    <thead>
+      <tr>
+        <th align="left" valign="top">Framework / provider</th>
+        <th align="left" valign="top">License / cost</th>
+        <th align="left" valign="top">Model-specific?</th>
+        <th align="left" valign="top">PII / security coverage</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>NeMo Guardrails (NVIDIA)</td><td>Apache 2.0; free software</td><td>No; supports multiple LLMs</td><td>PII masking rails via configured detector; input, output, dialog and tool rails</td></tr>
+      <tr><td>Guardrails AI</td><td>Apache 2.0 core; DetectPII MIT</td><td>No; model-agnostic</td><td>PII anonymization via Presidio; schemas and custom validators</td></tr>
+      <tr><td>Pangea AI Guard</td><td>Commercial; free evaluation</td><td>No; model-agnostic API</td><td>PII redaction, prompt-injection and secrets screening</td></tr>
+      <tr><td>Check Point AI Guardrails</td><td>Commercial</td><td>No; model-agnostic screening</td><td>Prompt attacks, data leakage and agent/tool policies; verify redaction</td></tr>
+      <tr><td>Amazon Bedrock Guardrails</td><td>Managed; usage-based</td><td>AWS service; check model/region support</td><td>Can mask/block PII; content, topic and prompt-attack filters</td></tr>
+      <tr><td>Google Model Armor</td><td>Managed; usage charges after free allowance</td><td>No; model/cloud-agnostic API</td><td>Prompt attacks and sensitive-data screening; confirm masking setup</td></tr>
+      <tr><td>Azure AI Content Safety</td><td>Managed Azure service</td><td>No; model-independent API</td><td>Content and prompt safety; no complete PII masking by itself</td></tr>
+      <tr><td>LlamaFirewall (Meta)</td><td>Open-source code</td><td>Scans different LLM workflows; some scanners use specific models</td><td>Prompt/agent security; experimental PII scanner detects but does not redact</td></tr>
+      <tr><td>Granite Guardian (IBM)</td><td>Apache 2.0 model</td><td>Uses IBM Granite judge model</td><td>Jailbreak, grounding and tool-call risk; no PII masking</td></tr>
+      <tr><td>LLM Guard (Protect AI)</td><td>MIT; archived in 2026</td><td>Target-model agnostic</td><td>Historically had anonymization and scanners; not recommended for new projects</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Shortlist:</strong> NeMo Guardrails for open source; evaluate Pangea, Check Point, or Google for managed screening. Backend authorization, MFA, transfer validation, idempotency, and audit logging remain mandatory.</p>
+</body>
+</html>

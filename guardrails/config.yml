@@ -1,0 +1,54 @@
+colang_version: "1.0"
+
+models:
+  - type: main
+    engine: openai
+    model: gemini-3.5-flash-lite
+    api_key_env_var: GEMINI_API_KEY
+    parameters:
+      base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+      temperature: 0
+
+instructions:
+  - type: general
+    content: |
+      You are a banking customer support assistant. Follow the banking and
+      financial topic boundary. Never request or reveal passwords, PINs, OTPs,
+      full card numbers, or full account credentials.
+
+rails:
+  input:
+    flows:
+      - mask sensitive data on input
+      - self check input $variant=banking_topic
+  output:
+    flows:
+      - self check output
+      - mask sensitive data on output
+
+  config:
+    sensitive_data_detection:
+      input:
+        entities:
+          - PERSON
+          - EMAIL_ADDRESS
+          - PHONE_NUMBER
+          - CREDIT_CARD
+          - IBAN_CODE
+          - US_BANK_NUMBER
+          - US_SSN
+          - US_DRIVER_LICENSE
+          - US_PASSPORT
+          - CRYPTO
+      output:
+        entities:
+          - PERSON
+          - EMAIL_ADDRESS
+          - PHONE_NUMBER
+          - CREDIT_CARD
+          - IBAN_CODE
+          - US_BANK_NUMBER
+          - US_SSN
+          - US_DRIVER_LICENSE
+          - US_PASSPORT
+          - CRYPTO

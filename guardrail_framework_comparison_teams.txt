@@ -1,0 +1,21 @@
+Guardrail Framework Comparison
+
+```text
+Framework / Provider      License / cost       Model-specific?   PII / security coverage
+------------------------  ------------------  ----------------  ------------------------------------------
+NeMo Guardrails           Apache 2.0 / free   No                PII masking*; input, output, dialog, tools
+Guardrails AI             OSS / Apache 2.0    No                PII anonymize*; schemas, custom validators
+Pangea AI Guard           Commercial          No                PII redaction; injection, secrets
+Check Point AI Guardrails Commercial          No                Prompt, data-leakage, agent/tool screening
+Amazon Bedrock Guardrails Managed / usage     AWS integration   Can mask/block PII; content, prompt filters
+Google Model Armor        Managed / usage     No                Sensitive data, prompt attacks; verify masking
+Azure AI Content Safety   Managed Azure       No                Content/prompt safety; no full PII masking
+LlamaFirewall             Open source         Some scanners     Agent/prompt security; PII detect, not redact
+Granite Guardian           Apache 2.0 model    Granite judge     Risk/tool-call judging; no PII masking
+LLM Guard                 MIT; archived        No                Historical anonymization; not for new projects
+
+* Uses/configures a detector such as Presidio or GLiNER; check dependencies.
+
+NeMo is the open-source option I recommend evaluating first. Keep account access,
+MFA, transfer execution, idempotency, and audit logging in backend services.
+```

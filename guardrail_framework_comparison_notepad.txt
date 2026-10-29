@@ -1,0 +1,54 @@
+GUARDRAIL FRAMEWORK COMPARISON
+
+Notepad plain-text table. Prices and features can change; verify with providers.
+
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Framework / provider       | License / cost          | Model-specific?          | What it does / banking fit                                   |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| NeMo Guardrails            | Apache 2.0; open source. | No; supports multiple    | Multi-provider input/output/dialog/tool rails. Can mask PII  |
+| NVIDIA                     |                          | LLM providers. Some      | through configured detector integrations. Check dependencies|
+|                            |                          | detectors use models.    | and Gemini/LangGraph integration.                            |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Guardrails AI              | Apache 2.0 core;         | No; model-agnostic       | Validators and structured-output checks. DetectPII can       |
+| Guardrails AI              | DetectPII MIT.           | framework.               | anonymize locally using Presidio; not a full agent-security  |
+|                            |                          |                          | platform.                                                     |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Pangea AI Guard            | Commercial; free         | No; model-agnostic API.  | Recipes can redact PII and screen for prompt injection,      |
+| Pangea                     | evaluation account.      |                          | secrets and malicious content. Review private deployment,    |
+|                            | SaaS/Edge/Private Cloud. |                          | retention, region and production pricing.                    |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Check Point AI Guardrails  | Commercial; SaaS or      | No; model-agnostic       | Screens prompt attacks, data leakage, moderation and        |
+| Check Point (Lakera)       | self-hosted container.   | screening.               | agent/tool behavior. Confirm exact PII redaction behavior.   |
+|                            | Pricing from vendor.     |                          |                                                              |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Amazon Bedrock Guardrails  | Managed, usage-based;    | AWS service; can screen  | Can block or mask PII; also content, topic, prompt-attack,   |
+| AWS                        | not open source.         | outside model invocation | grounding and reasoning checks. Check model/region support.  |
+|                            |                          | via ApplyGuardrail API.  |                                                              |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Google Model Armor        | Managed; free allowance | No; model/cloud-agnostic | Screens prompt injection, sensitive data, harmful content,  |
+| Google Cloud               | then usage charges.      | REST API.                | malware and unsafe URLs. Evaluate with Gemini; confirm       |
+|                            |                          |                          | redaction and data-processing details.                       |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Azure AI Content Safety   | Managed Azure service;   | No; screening API is     | Content moderation, Prompt Shields and other safety checks. |
+| Microsoft                  | F0 limited / S0 paid.    | not tied to one LLM.     | No complete PII masking pipeline by itself; partial fit.    |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| LlamaFirewall              | Open-source code;        | Scans different target   | Screens prompts and agent traces. Experimental PII scanner |
+| Meta                       | model terms may differ.  | LLMs; some scanners use  | detects/blocks but does not redact.                          |
+|                            |                          | specific models/services.|                                                              |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| Granite Guardian           | Apache 2.0 models;       | Yes; IBM Granite judge   | Judges jailbreak, grounding and tool-call risks. Can assess |
+| IBM                        | local compute required.  | model; evaluates outputs | other agents' outputs. No built-in PII masking pipeline.    |
+|                            |                          | from other agents.       |                                                              |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+| LLM Guard                  | MIT; archived in 2026,   | No; target-model         | Historically had anonymization and prompt/output scanners. |
+| Protect AI                 | no longer maintained.   | agnostic; scanners may   | Not recommended for a new production banking system.        |
+|                            |                          | use separate models.     |                                                              |
++----------------------------+--------------------------+--------------------------+--------------------------------------------------------------+
+
+SHORTLIST
+- Open source: evaluate NeMo Guardrails.
+- Managed PII redaction plus screening: evaluate Pangea AI Guard.
+- Also compare Check Point AI Guardrails and Google Model Armor.
+
+No guardrail replaces backend account authorization, MFA, transfer validation,
+idempotency or audit logging. Test using synthetic data, not real customer data.
