@@ -15,6 +15,14 @@ from services.orchestrator.cache import (
 from services.orchestrator import main as orchestrator_main
 
 
+async def _allow_advice_boundary(*args, **kwargs):
+    return {
+        "is_blocked": False,
+        "reason": "No regulated advice request.",
+        "refusal_message": "I can't provide personal investment advice or recommend whether to buy or sell investments.",
+    }
+
+
 @pytest.mark.parametrize(
     ("question", "expected"),
     [
@@ -85,7 +93,19 @@ def test_authenticated_balance_query_bypasses_faq_cache(monkeypatch) -> None:
         yield {"type": "completion"}
 
     async def collect_events() -> list[dict]:
-        async def passthrough_check(rails, content, user_id, request_path="/chat"):
+        monkeypatch.setattr(
+            orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+        )
+        async def classify_intent(rails, content, context):
+            return orchestrator_main.ChatIntentClassification(intent="other")
+
+        monkeypatch.setattr(
+            orchestrator_main, "_classify_chat_intent", classify_intent
+        )
+
+        async def passthrough_check(
+            rails, content, user_id, request_path="/chat", context=()
+        ):
             return content
 
         monkeypatch.setattr(orchestrator_main, "check_input", passthrough_check)

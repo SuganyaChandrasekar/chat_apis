@@ -62,6 +62,7 @@ class TransferErrorPayload(BaseModel):
 class ChatState(MessagesState):
     account_id: str
     tool_states: dict[str, str]
+    intent: str
 
 
 def is_new_transfer_request(content: str) -> bool:
@@ -272,13 +273,22 @@ def build_agent_graph(access_token: str, account_id: str):
             (message for message in reversed(state["messages"]) if isinstance(message, HumanMessage)),
             None,
         )
-        has_transfer_request = bool(
-            latest_user_message
-            and is_new_transfer_request(str(latest_user_message.content))
+        intent = state.get("intent")
+        has_transfer_request = (
+            intent == "transfer_request"
+            if intent
+            else bool(
+                latest_user_message
+                and is_new_transfer_request(str(latest_user_message.content))
+            )
         )
-        has_balance_request = bool(
-            latest_user_message
-            and _BALANCE_REQUEST_PATTERN.search(str(latest_user_message.content))
+        has_balance_request = (
+            intent == "balance_check"
+            if intent
+            else bool(
+                latest_user_message
+                and _BALANCE_REQUEST_PATTERN.search(str(latest_user_message.content))
+            )
         )
         available_tools = []
         if has_transfer_request:
@@ -373,6 +383,7 @@ def initial_chat_state(
         ),
         "account_id": account_id,
         "tool_states": {},
+        "intent": "",
     }
 
 

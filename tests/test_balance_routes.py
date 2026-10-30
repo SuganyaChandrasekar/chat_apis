@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import httpx
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 from uuid import uuid4
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -27,6 +28,34 @@ from services.orchestrator.main import (
 )
 from services.transfer import main as transfer_service
 from services.transfer.audit import TransferStart
+
+
+async def _allow_advice_boundary(*args, **kwargs):
+    return {
+        "is_blocked": False,
+        "reason": "No regulated advice request.",
+        "refusal_message": orchestrator_guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
+    }
+
+
+@pytest.fixture(autouse=True)
+def classify_other_intents_by_default(monkeypatch):
+    async def classify_intent(rails, content, context):
+        return orchestrator_main.ChatIntentClassification(intent="other")
+
+    monkeypatch.setattr(
+        orchestrator_main, "_classify_chat_intent", classify_intent
+    )
+
+
+def _intent_classifier(intent, **entities):
+    async def classify_intent(rails, content, context):
+        return orchestrator_main.ChatIntentClassification(
+            intent=intent,
+            **entities,
+        )
+
+    return classify_intent
 
 
 def test_balance_service_fails_closed_without_authentication() -> None:
@@ -520,6 +549,9 @@ def test_app_lifespan_initializes_guardrails_before_requests(monkeypatch) -> Non
 
 
 def test_chat_sse_masks_message_and_streams_graph_events(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
     secret = "test-secret-key-with-at-least-32-bytes"
     monkeypatch.setenv("JWT_SECRET", secret)
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
@@ -644,6 +676,19 @@ def test_chat_sse_rejects_foreign_thread_before_loading_checkpoint(monkeypatch) 
 
 
 def test_chat_balance_prompts_for_account_then_returns_selected_balance(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
+    async def classify_balance(rails, content, context):
+        hint = "Savings" if "saving" in content.casefold() else None
+        return orchestrator_main.ChatIntentClassification(
+            intent="balance_check",
+            account_hint=hint,
+        )
+
+    monkeypatch.setattr(
+        orchestrator_main, "_classify_chat_intent", classify_balance
+    )
     token = "validated-test-token"
     monkeypatch.setenv("BALANCE_SERVICE_URL", "http://balance.test")
 
@@ -792,6 +837,14 @@ def test_chat_balance_prompts_for_account_then_returns_selected_balance(monkeypa
 
 
 def test_chat_balance_uses_only_account_without_prompt(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier("balance_check"),
+    )
     token = "validated-test-token"
     monkeypatch.setenv("BALANCE_SERVICE_URL", "http://balance.test")
 
@@ -865,8 +918,20 @@ def test_contextual_sufficiency_followup_checks_current_balance(monkeypatch) -> 
     monkeypatch.setattr(
         orchestrator_guardrails, "append_audit_event", lambda event: None
     )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier(
+            "balance_sufficiency",
+            amount=500,
+            account_hint="Savings",
+        ),
+    )
 
     class FakeRails:
+        async def generate_async(self, prompt, **kwargs):
+            return '{"is_blocked": false, "reason": "Bank balance feasibility question."}'
+
         async def check_async(self, messages, **kwargs):
             assert messages[-1]["role"] == "user"
             assert "Latest user message to evaluate:\nIs this enough to transfer 500" in messages[-1]["content"]
@@ -960,6 +1025,14 @@ def test_contextual_sufficiency_followup_checks_current_balance(monkeypatch) -> 
 
 
 def test_incomplete_transfer_request_prompts_for_accounts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier("transfer_request"),
+    )
     async def passthrough_check(
         rails, content, user_id, request_path="/chat", context=()
     ):

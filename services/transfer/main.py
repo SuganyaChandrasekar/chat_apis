@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel
 
 from services.api_errors import register_exception_handlers
 from services.authentication import authenticated_subject
@@ -21,6 +22,7 @@ from services.transfer.audit import (
     IdempotencyConflict,
     append_transfer_status,
     begin_transfer,
+    latest_successful_transfer,
 )
 
 app = FastAPI(title="Transfer Service", version="0.1.0")
@@ -32,9 +34,41 @@ HIGH_VALUE_TRANSFER_THRESHOLD = Decimal(
 )
 
 
+class LatestTransferResponse(BaseModel):
+    source_account_id: str
+    destination_account_id: str
+
+
 @app.get("/health", tags=["health"])
 async def health_check() -> dict[str, str]:
     return {"service": "transfer", "status": "ok"}
+
+
+@app.get(
+    "/transfers/latest",
+    response_model=LatestTransferResponse,
+    tags=["sandbox"],
+    dependencies=[Depends(require_sandbox_mode)],
+)
+async def get_latest_transfer(
+    authenticated_account_id: str = Depends(authenticated_subject),
+) -> LatestTransferResponse:
+    try:
+        transfer = await asyncio.to_thread(
+            latest_successful_transfer,
+            authenticated_account_id,
+        )
+    except AuditStoreUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Transfer audit is unavailable"
+        ) from None
+    if transfer is None:
+        raise HTTPException(status_code=404, detail="No completed transfer found")
+
+    return LatestTransferResponse(
+        source_account_id=transfer.source_account_id,
+        destination_account_id=transfer.destination_account_id,
+    )
 
 
 @app.post(

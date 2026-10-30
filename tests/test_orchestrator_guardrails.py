@@ -1,11 +1,35 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from services.orchestrator import guardrails
 from services.orchestrator import main as orchestrator_main
 from services.orchestrator.pii import PiiMaskingUnavailable
+
+_REAL_CLASSIFY_CHAT_INTENT = orchestrator_main._classify_chat_intent
+
+
+@pytest.fixture(autouse=True)
+def allow_other_chat_intents_by_default(monkeypatch):
+    async def classify_intent(rails, content, context):
+        return orchestrator_main.ChatIntentClassification(intent="other")
+
+    monkeypatch.setattr(
+        orchestrator_main, "_classify_chat_intent", classify_intent
+    )
+
+
+def _intent_classifier(intent, **entities):
+    async def classify_intent(rails, content, context):
+        return orchestrator_main.ChatIntentClassification(
+            intent=intent,
+            **entities,
+        )
+
+    return classify_intent
 
 
 class FakeRails:
@@ -13,11 +37,20 @@ class FakeRails:
         self.results = iter(results)
         self.messages = []
         self.options = []
+        self.advice_evaluations = iter([])
+        self.advice_prompts = []
 
     async def check_async(self, messages, **kwargs):
         self.messages.append(messages)
         self.options.append(kwargs)
         return next(self.results)
+
+    async def generate_async(self, prompt, **kwargs):
+        self.advice_prompts.append(prompt)
+        try:
+            return next(self.advice_evaluations)
+        except StopIteration:
+            return '{"is_blocked": false, "reason": "No regulated advice request."}'
 
 
 def _result(status, content, rail=None):
@@ -26,6 +59,14 @@ def _result(status, content, rail=None):
         content=content,
         rail=rail,
     )
+
+
+async def _allow_advice_boundary(*args, **kwargs):
+    return {
+        "is_blocked": False,
+        "reason": "No regulated advice request.",
+        "refusal_message": guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
+    }
 
 
 def test_input_rail_returns_masked_content_and_audits_metadata(monkeypatch):
@@ -582,6 +623,11 @@ def test_pii_masking_failure_stops_chat_processing(monkeypatch):
 
 
 def test_account_number_question_does_not_trigger_balance_tool(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier("account_number"),
+    )
     monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
     rails = FakeRails(
         [
@@ -614,14 +660,21 @@ def test_account_number_question_does_not_trigger_balance_tool(monkeypatch):
     ]
 
 
-def test_last_transfer_question_uses_existing_conversation_context(monkeypatch):
+def test_last_transfer_question_reads_authenticated_transfer_service(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier("transfer_history"),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
     observed_input_context = []
     observed_output_context = []
     prior_messages = [
-        orchestrator_main.HumanMessage(
-            content="I transfered 1600 from Savings to Checking."
-        )
+        orchestrator_main.HumanMessage(content="Transfer 500 from Checking to Savings")
     ]
+    monkeypatch.setenv("TRANSFER_SERVICE_URL", "http://transfer.test")
 
     async def passthrough_input_check(
         rails, content, user_id, request_path="/chat", context=()
@@ -635,22 +688,41 @@ def test_last_transfer_question_uses_existing_conversation_context(monkeypatch):
         observed_output_context.extend(context)
         return content
 
-    async def fake_stream_agent_events(graph, state):
-        assert state["messages"][-2].content == prior_messages[0].content
-        assert state["messages"][-1].content == "How much was my last transfer?"
-        yield {
-            "type": "content",
-            "content": "You mentioned 1600 from Savings to Checking; I can't verify completion.",
-        }
-        yield {"type": "completion"}
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            assert timeout == 5.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exception_type, exception, traceback):
+            return False
+
+        async def get(self, url, headers):
+            assert headers == {"Authorization": "Bearer token"}
+            if url == "http://transfer.test/transfers/latest":
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("GET", url),
+                    json={
+                        "source_account_id": "checking-001",
+                        "destination_account_id": "savings-001",
+                    },
+                )
+            assert url == "http://localhost:8001/sandbox/accounts"
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", url),
+                json=[
+                    {"account_id": "checking-001", "label": "Checking account"},
+                    {"account_id": "savings-001", "label": "Savings account"},
+                ],
+            )
 
     monkeypatch.setattr(orchestrator_main, "sanitize_content", lambda content: content)
     monkeypatch.setattr(orchestrator_main, "check_input", passthrough_input_check)
     monkeypatch.setattr(orchestrator_main, "check_output", passthrough_output_check)
-    monkeypatch.setattr(orchestrator_main, "build_agent_graph", lambda *args: object())
-    monkeypatch.setattr(
-        orchestrator_main, "stream_agent_events", fake_stream_agent_events
-    )
+    monkeypatch.setattr(orchestrator_main.httpx, "AsyncClient", FakeAsyncClient)
 
     async def collect_events():
         return [
@@ -666,30 +738,53 @@ def test_last_transfer_question_uses_existing_conversation_context(monkeypatch):
 
     events = asyncio.run(collect_events())
 
-    assert events[0]["content"].startswith("You mentioned 1600")
+    assert events[0]["content"] == "It was transferred from Checking to Savings."
     assert events[-1] == {"type": "completion"}
     assert observed_input_context == [
-        {"role": "user", "content": "I transfered 1600 from Savings to Checking."}
+        {"role": "user", "content": "Transfer 500 from Checking to Savings"}
     ]
     assert observed_output_context == [
-        {"role": "user", "content": "I transfered 1600 from Savings to Checking."},
+        {"role": "user", "content": "Transfer 500 from Checking to Savings"},
         {"role": "user", "content": "How much was my last transfer?"},
     ]
 
 
-def test_last_transfer_without_prior_context_does_not_guess(monkeypatch):
+def test_last_transfer_question_reports_when_no_completed_transfer_exists(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main, "_classify_chat_intent", _intent_classifier("transfer_history")
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
+    monkeypatch.setenv("TRANSFER_SERVICE_URL", "http://transfer.test")
+
     async def passthrough_check(
         rails, content, user_id, request_path="/chat", context=()
     ):
         return content
 
-    def unexpected_model_call(*args, **kwargs):
-        raise AssertionError("Missing transfer history must not be guessed by the model")
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            assert timeout == 5.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exception_type, exception, traceback):
+            return False
+
+        async def get(self, url, headers):
+            assert url == "http://transfer.test/transfers/latest"
+            return httpx.Response(
+                404,
+                request=httpx.Request("GET", url),
+                json={"detail": "No completed transfer found"},
+            )
 
     monkeypatch.setattr(orchestrator_main, "sanitize_content", lambda content: content)
     monkeypatch.setattr(orchestrator_main, "check_input", passthrough_check)
     monkeypatch.setattr(orchestrator_main, "check_output", passthrough_check)
-    monkeypatch.setattr(orchestrator_main, "build_agent_graph", unexpected_model_call)
+    monkeypatch.setattr(orchestrator_main.httpx, "AsyncClient", FakeAsyncClient)
 
     async def collect_events():
         return [
@@ -697,18 +792,23 @@ def test_last_transfer_without_prior_context_does_not_guess(monkeypatch):
             async for event in orchestrator_main._stream_response(
                 "token",
                 "account-123",
-                "How much was my last transfer?",
+                "To which account did I make my latest transfer?",
                 guardrails=object(),
             )
         ]
 
     events = asyncio.run(collect_events())
 
-    assert "can't retrieve completed transfer history" in events[0]["content"]
-    assert events[-1] == {"type": "completion"}
+    assert events == [
+        {"type": "content", "content": "I couldn't find a completed transfer for your account."},
+        {"type": "completion"},
+    ]
 
 
 def test_reported_past_transfer_is_saved_as_conversation_context(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
     turn_messages = []
 
     async def passthrough_check(
@@ -863,6 +963,19 @@ def test_displayed_balance_amount_is_persisted_until_session_expiry(monkeypatch)
 
 
 def test_exact_balance_followup_uses_recent_stored_amount(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier(
+            "balance_history",
+            prior_balance_account="Checking account",
+            prior_balance_currency="USD",
+            prior_balance_amount=1500,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
     prior_messages = [
         orchestrator_main.AIMessage(
             content="Earlier balance check for Checking account: USD 1,500.00."
@@ -912,6 +1025,14 @@ def test_exact_balance_followup_uses_recent_stored_amount(monkeypatch):
 def test_balance_recall_after_expiry_uses_contextual_agent_not_balance_picker(
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier("balance_history"),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
     prior_messages = [
         orchestrator_main.HumanMessage(content="What is my Savings balance?"),
         orchestrator_main.AIMessage(
@@ -997,3 +1118,305 @@ def test_blocked_chat_output_is_replaced_with_refusal(monkeypatch):
         {"type": "content", "content": guardrails.REFUSAL_MESSAGE},
         {"type": "completion"},
     ]
+
+
+@pytest.mark.parametrize(
+    "query_text",
+    [
+        "Should I sell my shares?",
+        "Which stocks should I buy?",
+        "Give me buy/sell guidance on ETFs.",
+        "Can you give me personal investment advice?",
+        "Can you provide buy/sell guidance?",
+        "What do you think?",
+    ],
+)
+def test_advice_boundary_blocks_and_audits_without_query_text(monkeypatch, query_text):
+    recorded_events = []
+    monkeypatch.setattr(guardrails, "append_audit_event", recorded_events.append)
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            json.dumps(
+                {
+                    "is_blocked": True,
+                    "reason": "The user is asking for a personal recommendation.",
+                }
+            )
+        ]
+    )
+
+    decision = asyncio.run(
+        guardrails.check_advice_boundary(
+            query_text,
+            rails=rails,
+            user_id="account-123",
+        )
+    )
+
+    assert decision == {
+        "is_blocked": True,
+        "reason": "The user is asking for a personal recommendation.",
+        "refusal_message": guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
+    }
+    assert recorded_events[0].severity == "WARNING"
+    assert recorded_events[0].user_id == "account-123"
+    assert recorded_events[0].source == "fca_advice_boundary"
+    assert recorded_events[0].details == {
+        "direction": "advice_boundary",
+        "decision": "blocked",
+        "rail": "fca_advice_boundary",
+        "reason": "LLM classified request as seeking regulated personal investment advice.",
+    }
+    assert query_text not in str(recorded_events[0].details)
+    assert "Latest user query" in rails.advice_prompts[0]
+
+
+def test_advice_boundary_checks_conversation_context():
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            json.dumps(
+                {
+                    "is_blocked": False,
+                    "reason": "This is a simple balance check.",
+                }
+            )
+        ]
+    )
+    history = [
+        {"role": "user", "content": "What is my balance?"},
+        {"role": "assistant", "content": "Your balance is USD 500."},
+    ]
+
+    decision = asyncio.run(
+        guardrails.check_advice_boundary(
+            "Can I see it?",
+            history,
+            rails=rails,
+        )
+    )
+
+    assert decision == {
+        "is_blocked": False,
+        "reason": "This is a simple balance check.",
+        "refusal_message": guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
+    }
+    assert json.dumps(history) in rails.advice_prompts[0]
+
+
+def test_advice_boundary_blocks_personal_recommendation_in_balance_context(monkeypatch):
+    monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            json.dumps(
+                {
+                    "is_blocked": True,
+                    "reason": "The user asks whether to buy a specific asset.",
+                }
+            )
+        ]
+    )
+    history = [
+        {"role": "user", "content": "What is my balance?"},
+        {"role": "assistant", "content": "Your balance is USD 500."},
+    ]
+
+    decision = asyncio.run(
+        guardrails.check_advice_boundary(
+            "Should I buy stock with this balance?",
+            history,
+            rails=rails,
+        )
+    )
+
+    assert decision["is_blocked"] is True
+    assert json.dumps(history) in rails.advice_prompts[0]
+    assert "Should I buy stock with this balance?" in rails.advice_prompts[0]
+
+
+def test_advice_boundary_allows_transfer_affordability_followup(monkeypatch):
+    monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            json.dumps(
+                {
+                    "is_blocked": False,
+                    "reason": "The user is checking whether their balance covers a transfer.",
+                }
+            )
+        ]
+    )
+    history = [
+        {"role": "user", "content": "Check my savings account balance"},
+        {
+            "role": "assistant",
+            "content": "Your savings account balance is USD 3,200.00.",
+        },
+    ]
+
+    decision = asyncio.run(
+        guardrails.check_advice_boundary(
+            "Is it enough to transfer 500?",
+            history,
+            rails=rails,
+        )
+    )
+
+    assert decision["is_blocked"] is False
+    assert json.dumps(history) in rails.advice_prompts[0]
+    assert "ordinary banking, not investment advice" in rails.advice_prompts[0]
+    assert "Is it enough to transfer 500?" in rails.advice_prompts[0]
+
+
+def test_advice_boundary_fails_closed_for_invalid_model_output():
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(["not valid JSON"])
+
+    with pytest.raises(guardrails.GuardrailsUnavailable):
+        asyncio.run(
+            guardrails.check_advice_boundary(
+                "Should I buy shares?",
+                rails=rails,
+            )
+        )
+
+
+def test_advice_boundary_accepts_structured_json_wrapped_in_markdown(monkeypatch):
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            '```json\n{"is_blocked": true, "reason": "Specific investment advice."}\n```'
+        ]
+    )
+    monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
+
+    decision = asyncio.run(
+        guardrails.check_advice_boundary(
+            "Should I buy shares?",
+            rails=rails,
+        )
+    )
+
+    assert decision["is_blocked"] is True
+    assert decision["reason"] == "Specific investment advice."
+
+
+def test_chat_intent_classifier_extracts_contextual_entities():
+    class IntentRails:
+        prompts = []
+
+        async def generate_async(self, prompt, options):
+            self.prompts.append(prompt)
+            return (
+                '```json\n{"intent":"balance_sufficiency","amount":"500.00",'
+                '"account_hint":"Savings"}\n```'
+            )
+
+    rails = IntentRails()
+    context = [
+        {"role": "user", "content": "Check my savings balance"},
+        {"role": "assistant", "content": "Your Savings balance is USD 3,200.00."},
+    ]
+
+    result = asyncio.run(
+        _REAL_CLASSIFY_CHAT_INTENT(
+            rails,
+            "Is it enough for 500?",
+            context,
+        )
+    )
+
+    assert result.intent == "balance_sufficiency"
+    assert result.amount == 500
+    assert result.account_hint == "Savings"
+    assert json.dumps(context) in rails.prompts[0]
+
+
+def test_chat_intent_classifier_fails_closed_on_invalid_output():
+    class IntentRails:
+        async def generate_async(self, prompt, options):
+            return '{"intent":"balance_check","amount":"not-an-amount"}'
+
+    with pytest.raises(guardrails.GuardrailsUnavailable):
+        asyncio.run(
+            _REAL_CLASSIFY_CHAT_INTENT(
+                IntentRails(),
+                "Check my balance",
+                [],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_output", "expected_blocked"),
+    [
+        ("BLOCK: Personal investment advice requested.", True),
+        ("ALLOW: General banking question.", False),
+        ("Yes", True),
+        ("No.", False),
+    ],
+)
+def test_advice_boundary_accepts_explicit_plain_text_decisions(
+    monkeypatch, model_output, expected_blocked
+):
+    monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
+    rails = FakeRails([])
+    rails.advice_evaluations = iter([model_output])
+
+    decision = asyncio.run(
+        guardrails.check_advice_boundary(
+            "User question",
+            rails=rails,
+        )
+    )
+
+    assert decision["is_blocked"] is expected_blocked
+    assert decision["reason"]
+
+
+def test_blocked_advice_boundary_suppresses_model_and_returns_regulatory_refusal(
+    monkeypatch,
+):
+    recorded_events = []
+    monkeypatch.setattr(guardrails, "append_audit_event", recorded_events.append)
+    monkeypatch.setattr(orchestrator_main, "sanitize_content", lambda content: content)
+
+    async def unexpected_input_check(*args, **kwargs):
+        raise AssertionError("Blocked investment requests must not reach NeMo")
+
+    def unexpected_agent_call(*args, **kwargs):
+        raise AssertionError("Blocked investment requests must not reach the model")
+
+    monkeypatch.setattr(orchestrator_main, "check_input", unexpected_input_check)
+    monkeypatch.setattr(orchestrator_main, "build_agent_graph", unexpected_agent_call)
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            '{"is_blocked": true, "reason": "Personal asset advice requested."}'
+        ]
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_response(
+                "token",
+                "account-123",
+                "Should I buy shares in this company?",
+                guardrails=rails,
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        {
+            "type": "content",
+            "content": guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
+        },
+        {"type": "completion"},
+    ]
+    assert recorded_events[0].details["decision"] == "blocked"

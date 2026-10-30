@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    func,
     select,
 )
 from sqlalchemy.exc import IntegrityError
@@ -60,6 +61,12 @@ class TransferStart:
     transaction_id: str
     status: str
     replayed: bool
+
+
+@dataclass(frozen=True)
+class LatestSuccessfulTransfer:
+    source_account_id: str
+    destination_account_id: str
 
 
 @lru_cache(maxsize=1)
@@ -165,5 +172,57 @@ def append_transfer_status(
                 )
             )
             session.commit()
+    except Exception:
+        raise AuditStoreUnavailable from None
+
+
+def latest_successful_transfer(account_id: str) -> LatestSuccessfulTransfer | None:
+    latest_status = (
+        select(
+            TransferAuditEvent.transaction_id.label("transaction_id"),
+            TransferAuditEvent.source_account_id.label("source_account_id"),
+            TransferAuditEvent.destination_account_id.label(
+                "destination_account_id"
+            ),
+            TransferAuditEvent.status.label("status"),
+            TransferAuditEvent.created_at.label("created_at"),
+            TransferAuditEvent.event_id.label("event_id"),
+            func.row_number()
+            .over(
+                partition_by=TransferAuditEvent.transaction_id,
+                order_by=(
+                    TransferAuditEvent.created_at.desc(),
+                    TransferAuditEvent.event_id.desc(),
+                ),
+            )
+            .label("status_rank"),
+        )
+        .where(TransferAuditEvent.account_id == account_id)
+        .subquery()
+    )
+    statement = (
+        select(
+            latest_status.c.source_account_id,
+            latest_status.c.destination_account_id,
+        )
+        .where(
+            latest_status.c.status_rank == 1,
+            latest_status.c.status == "SUCCESS",
+        )
+        .order_by(
+            latest_status.c.created_at.desc(),
+            latest_status.c.event_id.desc(),
+        )
+        .limit(1)
+    )
+    try:
+        with Session(_engine()) as session:
+            row = session.execute(statement).one_or_none()
+            if row is None:
+                return None
+            return LatestSuccessfulTransfer(
+                source_account_id=row.source_account_id,
+                destination_account_id=row.destination_account_id,
+            )
     except Exception:
         raise AuditStoreUnavailable from None
