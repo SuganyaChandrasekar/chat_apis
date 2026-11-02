@@ -10,7 +10,7 @@ from services.orchestrator.cache import (
     NoOpFAQCache,
     RedisFAQCache,
     create_faq_cache,
-    is_cacheable_public_question,
+    is_cacheable_public_intent,
 )
 from services.orchestrator import main as orchestrator_main
 
@@ -24,25 +24,37 @@ async def _allow_advice_boundary(*args, **kwargs):
 
 
 @pytest.mark.parametrize(
-    ("question", "expected"),
+    ("intent", "expected"),
     [
-        ("What is a bank account?", True),
-        ("How do ACH payments work?", True),
-        ("Why do banks charge fees?", True),
-        ("Can you explain how overdrafts work?", True),
-        ("What is my balance?", False),
-        ("How much is in my account?", False),
-        ("Show me my transaction history", False),
-        ("How do I transfer money?", False),
-        ("Can I make a payment from my account?", False),
-        ("What is the balance on account 12345?", False),
-        ("How do I check my card statement?", False),
-        ("What is the account number for my card?", False),
-        ("How can I review my transaction history?", False),
+        ("public_faq", True),
+        ("balance_check", False),
+        ("balance_sufficiency", False),
+        ("transaction_history", False),
+        ("transfer_history", False),
+        ("transfer_request", False),
+        ("account_number", False),
+        ("other", False),
     ],
 )
-def test_public_faq_questions_are_cacheable(question: str, expected: bool) -> None:
-    assert is_cacheable_public_question(question) is expected
+def test_only_public_faq_intent_is_cacheable(intent: str, expected: bool) -> None:
+    assert is_cacheable_public_intent(intent) is expected
+
+
+def test_public_faq_intent_is_classified_semantically() -> None:
+    class FakeRails:
+        async def generate_async(self, prompt, options):
+            assert "public_faq" in prompt
+            assert "general informational questions about banking concepts" in prompt
+            return '{"intent":"public_faq"}'
+
+    classification = asyncio.run(
+        orchestrator_main._classify_chat_intent(
+            FakeRails(), "Could you walk me through how overdrafts work?", []
+        )
+    )
+
+    assert classification.intent == "public_faq"
+    assert is_cacheable_public_intent(classification.intent)
 
 
 def test_faq_cache_uses_configured_ttl(monkeypatch) -> None:

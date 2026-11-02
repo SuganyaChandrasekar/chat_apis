@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import os
-import re
 from abc import ABC, abstractmethod
 
 from redis.asyncio import Redis
@@ -10,20 +9,6 @@ logger = logging.getLogger("uvicorn.error")
 
 DEFAULT_FAQ_CACHE_TTL_SECONDS = 300
 DEFAULT_FAQ_CACHE_PREFIX = "bank-chatbot:faq"
-
-_PUBLIC_QUERY_PATTERN = re.compile(
-    r"\b(?:what is|how does|how do|why does|why do|what are|how can|describe|explain)\b"
-)
-_PERSONAL_QUERY_PATTERN = re.compile(
-    r"\b(?:my|me|mine)\s+(?:balance|account|transaction|transfer|payment|purchase|order|card|statement|invoice|receipt|fee|debit|credit)\b"
-    r"|\b(?:balance|account|transaction history|transaction|transfer|payment|purchase|order|card|statement|invoice|receipt)\s+(?:of|for|on|in)\s+(?:my|me|mine)\b"
-    r"|\b(?:show|check|find|view|get)\s+(?:my|me|mine)\s+(?:balance|account|transaction|transfer|payment|purchase|order|card|statement|invoice|receipt)\b"
-    r"|\b(?:i|we)\s+(?:want|need|have|can|could|should|will)\s+(?:to\s+)?(?:check|view|get|find|know|see|make|send|receive|complete|review|track)\s+(?:my|the)?\s*(?:balance|account|transaction|transfer|payment|purchase|order|card|statement|invoice|receipt)\b"
-    r"|\b(?:i|we)\s+(?:balance|check|view|get|find|review|track|transfer|send|receive|make|complete)\s+(?:my|the)?\s*(?:balance|account|transaction|transfer|payment|purchase|order|card|statement|invoice|receipt)\b"
-    r"|\b(?:how do|how can)\s+(?:i|we)\s+(?:transfer|send|receive|make|complete|review|track|check|view|get|find)\b"
-    r"|\b(?:balance|account|transaction|transfer|payment|purchase|order|card|statement|invoice|receipt)\s+(?:on|for)\s+account\b"
-)
-
 
 class FAQCache(ABC):
     @property
@@ -96,12 +81,9 @@ def _cache_ttl_seconds() -> int:
     return ttl_seconds
 
 
-def is_cacheable_public_question(question: str) -> bool:
-    """Return whether a question is safe to serve from a shared FAQ cache."""
-    normalized = " ".join(question.casefold().split())
-    if not _PUBLIC_QUERY_PATTERN.search(normalized):
-        return False
-    return not _PERSONAL_QUERY_PATTERN.search(normalized)
+def is_cacheable_public_intent(intent: str) -> bool:
+    """Return whether the semantic classifier identified a public FAQ request."""
+    return intent == "public_faq"
 
 
 def create_faq_cache() -> FAQCache:

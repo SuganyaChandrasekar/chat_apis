@@ -392,6 +392,17 @@ def test_affirmative_after_balance_offer_opens_balance_account_options(monkeypat
 
     monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
 
+    async def classify_balance_confirmation(rails, content, context):
+        assert content == "yes"
+        assert context[-1]["content"] == (
+            "Would you like to check the balance of one of these accounts?"
+        )
+        return orchestrator_main.ChatIntentClassification(intent="balance_check")
+
+    monkeypatch.setattr(
+        orchestrator_main, "_classify_chat_intent", classify_balance_confirmation
+    )
+
     class FakeResponse:
         def __init__(self, payload):
             self.payload = payload

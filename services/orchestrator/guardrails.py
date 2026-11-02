@@ -17,17 +17,6 @@ ADVICE_BOUNDARY_REFUSAL_MESSAGE = (
     "assessment; please speak with an FCA-authorised financial adviser."
 )
 MAX_GUARDRAIL_CONTEXT_CHARS = 6000
-_BALANCE_OFFER_CONFIRMATIONS = {
-    "yes",
-    "yeah",
-    "yep",
-    "sure",
-    "okay",
-    "ok",
-    "please do",
-    "absolutely",
-}
-_BALANCE_OFFER_TEXT = "would you like to check"
 
 
 class GuardrailViolation(Exception):
@@ -78,32 +67,6 @@ def _input_with_context(
         f"{history_text}\n"
         "Latest user message to evaluate:\n"
         f"{content}"
-    )
-
-
-def is_balance_offer_confirmation(
-    content: str, context: Sequence[dict[str, str]]
-) -> bool:
-    normalized_content = content.strip().casefold().rstrip(".!?").strip()
-    if normalized_content not in _BALANCE_OFFER_CONFIRMATIONS:
-        return False
-    latest_message = next(
-        (
-            message
-            for message in reversed(context)
-            if message.get("role") in {"user", "assistant"}
-        ),
-        None,
-    )
-    return bool(
-        latest_message
-        and latest_message.get("role") == "assistant"
-        and isinstance(latest_message.get("content"), str)
-        and _BALANCE_OFFER_TEXT in latest_message["content"].casefold()
-        and (
-            "the balance" in latest_message["content"].casefold()
-            or "your balance" in latest_message["content"].casefold()
-        )
     )
 
 

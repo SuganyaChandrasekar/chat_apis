@@ -129,16 +129,18 @@ def test_balance_tool_is_only_enabled_for_balance_questions(monkeypatch) -> None
     account_id = "sandbox-checking-001"
     graph = agent.build_agent_graph("validated-token", account_id)
 
-    for content, expected_tools in [
+    for content, intent, expected_tools in [
         (
             "I'm asking about my savings account. I plan to deposit $200 each "
             "month. What does an automatic deposit do?",
+            "other",
             [],
         ),
-        ("What is my current balance?", ["check_balance"]),
+        ("What is my current balance?", "balance_check", ["check_balance"]),
     ]:
         captured_tools.clear()
         state = agent.initial_chat_state(content, account_id)
+        state["intent"] = intent
         asyncio.run(graph.ainvoke(state))
         assert captured_tools == expected_tools
 
@@ -231,6 +233,7 @@ def test_prepare_transfer_is_registered_and_streamed_as_confirmation(monkeypatch
     state = agent.initial_chat_state(
         "Transfer $1,000 from savings to checking", account_id
     )
+    state["intent"] = "transfer_request"
 
     async def collect_events():
         return [event async for event in agent.stream_agent_events(graph, state)]

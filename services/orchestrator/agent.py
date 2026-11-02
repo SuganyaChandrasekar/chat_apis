@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-import re
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 from urllib.parse import quote
@@ -26,12 +26,6 @@ HIGH_VALUE_TRANSFER_THRESHOLD = Decimal(
     os.getenv("HIGH_VALUE_TRANSFER_THRESHOLD", "1000.00")
 )
 MAX_CONVERSATION_MESSAGES = 20
-_NEW_TRANSFER_REQUEST_PATTERN = re.compile(
-    r"^\s*(?:please\s+)?(?:transfer|send|move)\b"
-    r"|\b(?:i want|i'd like|can you|could you|please)\s+(?:to\s+)?"
-    r"(?:transfer|send|move)\b",
-    re.IGNORECASE,
-)
 
 class BalanceFinancialPayload(BaseModel):
     kind: str = "balance"
@@ -59,44 +53,49 @@ class TransferErrorPayload(BaseModel):
     message: str = Field(min_length=1, max_length=512)
 
 
+class TransactionRecord(BaseModel):
+    transaction_id: str = Field(min_length=1, max_length=128)
+    date: date
+    amount: Decimal
+    currency: str = Field(min_length=1, max_length=3)
+    description: str = Field(min_length=1, max_length=256)
+    merchant: str = Field(min_length=1, max_length=128)
+
+
+class RecentTransactionsPayload(BaseModel):
+    kind: str = "transactions"
+    account_id: str = Field(min_length=1, max_length=128)
+    transactions: list[TransactionRecord]
+
+
 class ChatState(MessagesState):
     account_id: str
     tool_states: dict[str, str]
     intent: str
-
-
-def is_new_transfer_request(content: str) -> bool:
-    return bool(_NEW_TRANSFER_REQUEST_PATTERN.search(content))
+    transaction_limit: int
+    transaction_account_hint: str | None
+    transaction_date_hint: str | None
+    transaction_merchant_hint: str | None
 
 
 def append_conversation_message(state: ChatState, message: BaseMessage) -> None:
     state["messages"] = add_messages(state["messages"], [message])[-MAX_CONVERSATION_MESSAGES:]
 
 
-_FINANCIAL_REQUEST_PATTERN = re.compile(
-    r"\b(?:balance|account|transaction|transfer|payment|purchase|card|statement|receipt|invoice|fee|debit|credit)\b",
-    re.IGNORECASE,
-)
-_BALANCE_REQUEST_PATTERN = re.compile(
-    r"\b(?:check|show|tell me|what(?:'s| is)|give me|view|retrieve)\b"
-    r".{0,50}\bbalance\b|\bhow much(?:\s+money)?\s+do i have\b",
-    re.IGNORECASE,
-)
-
-
 def _requires_atomic_financial_response(state: ChatState) -> bool:
-    latest_user_message = next(
-        (message for message in reversed(state["messages"]) if isinstance(message, HumanMessage)),
-        None,
-    )
-    return bool(
-        latest_user_message
-        and _FINANCIAL_REQUEST_PATTERN.search(str(latest_user_message.content))
-    )
+    return state.get("intent") in {
+        "balance_check",
+        "balance_sufficiency",
+        "balance_history",
+        "account_number",
+        "transfer_history",
+        "transaction_history",
+        "transfer_request",
+    }
 
 
 def _resolve_linked_account(candidate: str, accounts: list[dict]) -> dict | None:
-    normalized = re.sub(r"\s+", " ", candidate).strip().casefold()
+    normalized = " ".join(candidate.split()).casefold()
     exact_matches = [
         account
         for account in accounts
@@ -107,8 +106,12 @@ def _resolve_linked_account(candidate: str, accounts: list[dict]) -> dict | None
         return exact_matches[0]
     account_type_matches = []
     for account in accounts:
-        label = account["label"].strip()
-        account_type = re.sub(r"\s+account$", "", label, flags=re.IGNORECASE).strip()
+        label = " ".join(account["label"].split())
+        account_type = (
+            label[: -len(" account")].strip()
+            if label.casefold().endswith(" account")
+            else label
+        )
         aliases = {account_type.casefold()}
         if account_type.casefold().endswith("s"):
             aliases.add(account_type[:-1].casefold())
@@ -124,7 +127,46 @@ def _resolve_linked_account(candidate: str, accounts: list[dict]) -> dict | None
     return partial_matches[0] if len(partial_matches) == 1 else None
 
 
+def _transaction_date_range(date_hint: str | None) -> tuple[date | None, date | None]:
+    if not date_hint:
+        return None, None
+    hint = " ".join(date_hint.casefold().split())
+    today = date.today()
+    if hint in {"recent", "recently"}:
+        return None, None
+    if hint == "today":
+        return today, today
+    if hint == "yesterday":
+        yesterday = today - timedelta(days=1)
+        return yesterday, yesterday
+    if hint in {"last week", "past week", "last 7 days", "past 7 days", "this week"}:
+        return today - timedelta(days=6), today
+    day_range = hint.split()
+    if (
+        len(day_range) == 3
+        and day_range[0] in {"last", "past"}
+        and day_range[1].isdigit()
+        and day_range[2] in {"day", "days"}
+    ):
+        days = int(day_range[1])
+        if 1 <= days <= 3650:
+            return today - timedelta(days=days - 1), today
+        return None, None
+    if hint == "this month":
+        return today.replace(day=1), today
+    if hint == "last month":
+        last_day_previous_month = today.replace(day=1) - timedelta(days=1)
+        return last_day_previous_month.replace(day=1), last_day_previous_month
+    try:
+        parsed_date = date.fromisoformat(hint)
+    except ValueError:
+        return None, None
+    return parsed_date, today
+
+
 def build_agent_tools(access_token: str, account_id: str):
+    default_account_id = account_id
+
     @tool
     async def check_balance() -> str:
         """Get the authenticated customer's account balance."""
@@ -254,7 +296,93 @@ def build_agent_tools(access_token: str, account_id: str):
             }
         )
 
-    return [check_balance, prepare_transfer]
+    @tool
+    async def get_recent_transactions(
+        account_id: str | None = None,
+        limit: int = 10,
+        date_hint: str | None = None,
+        merchant_hint: str | None = None,
+    ) -> str:
+        """Get recent transactions for one of the customer's linked sandbox accounts.
+
+        Use the linked account name (such as "checking" or "savings") when the user
+        specifies an account. Do not invent account IDs or transaction details.
+        """
+        if not 1 <= limit <= 100:
+            return "Please request between 1 and 100 transactions."
+        date_from, date_to = _transaction_date_range(date_hint)
+        if date_hint and date_from is None:
+            return (
+                "I couldn't interpret that date range. Please specify a date or "
+                "period such as this month."
+            )
+
+        balance_url = os.getenv("BALANCE_SERVICE_URL", "http://localhost:8001")
+        headers = {"Authorization": f"Bearer {access_token}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                accounts_response = await client.get(
+                    f"{balance_url.rstrip('/')}/sandbox/accounts",
+                    headers=headers,
+                )
+                accounts_response.raise_for_status()
+                accounts = accounts_response.json()
+                if not isinstance(accounts, list) or any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("account_id"), str)
+                    or not isinstance(item.get("label"), str)
+                    for item in accounts
+                ):
+                    raise ValueError("Invalid linked-account response")
+
+                selected = (
+                    _resolve_linked_account(account_id, accounts)
+                    if account_id
+                    else next(
+                        (
+                            item
+                            for item in accounts
+                            if item["account_id"] == default_account_id
+                        ),
+                        None,
+                    )
+                )
+                if selected is None and not account_id and len(accounts) == 1:
+                    selected = accounts[0]
+                if selected is None:
+                    if account_id:
+                        return (
+                            "I couldn't match that to one of your linked accounts. "
+                            "Which account should I check?"
+                        )
+                    return "Which linked account would you like me to check?"
+
+                params: dict[str, str | int] = {"limit": limit}
+                if date_from is not None:
+                    params["date_from"] = date_from.isoformat()
+                if date_to is not None:
+                    params["date_to"] = date_to.isoformat()
+                if merchant_hint:
+                    params["merchant"] = merchant_hint[:128]
+                response = await client.get(
+                    f"{balance_url.rstrip('/')}/accounts/"
+                    f"{quote(selected['account_id'], safe='')}/transactions",
+                    headers=headers,
+                    params=params,
+                )
+                response.raise_for_status()
+                payload = RecentTransactionsPayload(
+                    account_id=selected["account_id"],
+                    transactions=response.json(),
+                )
+        except (httpx.RequestError, httpx.HTTPStatusError):
+            return "Transaction information is currently unavailable."
+        except (ValueError, TypeError, ValidationError):
+            return "Transaction information is currently unavailable."
+
+        return payload.model_dump_json()
+
+    return [check_balance, prepare_transfer, get_recent_transactions]
 
 
 def build_agent_graph(access_token: str, account_id: str):
@@ -269,31 +397,13 @@ def build_agent_graph(access_token: str, account_id: str):
             raise RuntimeError("Chat model is not configured")
         model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
         logger.info("Starting Gemini request with model %s", model_name)
-        latest_user_message = next(
-            (message for message in reversed(state["messages"]) if isinstance(message, HumanMessage)),
-            None,
-        )
         intent = state.get("intent")
-        has_transfer_request = (
-            intent == "transfer_request"
-            if intent
-            else bool(
-                latest_user_message
-                and is_new_transfer_request(str(latest_user_message.content))
-            )
-        )
-        has_balance_request = (
-            intent == "balance_check"
-            if intent
-            else bool(
-                latest_user_message
-                and _BALANCE_REQUEST_PATTERN.search(str(latest_user_message.content))
-            )
-        )
         available_tools = []
-        if has_transfer_request:
+        if intent == "transfer_request":
             available_tools = [tools_by_name["prepare_transfer"]]
-        elif has_balance_request:
+        elif intent == "transaction_history":
+            available_tools = [tools_by_name["get_recent_transactions"]]
+        elif intent == "balance_check":
             available_tools = [tools_by_name["check_balance"]]
         model = ChatGoogleGenerativeAI(
             model=model_name,
@@ -322,7 +432,19 @@ def build_agent_graph(access_token: str, account_id: str):
             else:
                 logger.info("Executing agent tool %s", call["name"])
                 try:
-                    result = await registered_tool.ainvoke(call["args"])
+                    tool_args = dict(call["args"])
+                    if call["name"] == "get_recent_transactions":
+                        tool_args.update(
+                            {
+                                "account_id": state.get("transaction_account_hint"),
+                                "limit": state.get("transaction_limit", 10),
+                                "date_hint": state.get("transaction_date_hint"),
+                                "merchant_hint": state.get(
+                                    "transaction_merchant_hint"
+                                ),
+                            }
+                        )
+                    result = await registered_tool.ainvoke(tool_args)
                     states[call_id] = "completed"
                     logger.info("Agent tool %s completed", call["name"])
                 except Exception:
@@ -384,6 +506,10 @@ def initial_chat_state(
         "account_id": account_id,
         "tool_states": {},
         "intent": "",
+        "transaction_limit": 10,
+        "transaction_account_hint": None,
+        "transaction_date_hint": None,
+        "transaction_merchant_hint": None,
     }
 
 
@@ -472,11 +598,36 @@ def _validated_transfer_error(tool_message: ToolMessage, account_id: str) -> dic
     return {"type": "content", "content": payload.message}
 
 
+def _format_recent_transactions(tool_message: ToolMessage) -> str | None:
+    if tool_message.name != "get_recent_transactions":
+        return None
+    try:
+        payload = RecentTransactionsPayload.model_validate_json(
+            str(tool_message.content)
+        )
+    except (ValidationError, ValueError, TypeError):
+        message = str(tool_message.content).strip()
+        return message or "Transaction information is currently unavailable."
+
+    if not payload.transactions:
+        return "No transactions matched your request."
+    lines = ["Recent transactions:"]
+    for transaction in payload.transactions:
+        transaction_date = transaction.date.strftime("%b %d, %Y").replace(" 0", " ")
+        lines.append(
+            f"- {transaction_date} | {transaction.merchant}: "
+            f"{transaction.description} | {transaction.currency} "
+            f"{transaction.amount:,.2f}"
+        )
+    return "\n".join(lines)
+
+
 async def stream_agent_events(graph, state: ChatState):
     buffered_content = []
     financial_events = []
     transfer_events = []
     transfer_error_events = []
+    transaction_results = []
     requires_atomic_response = _requires_atomic_financial_response(state)
 
     async for chunk, _metadata in graph.astream(state, stream_mode="messages"):
@@ -488,6 +639,9 @@ async def stream_agent_events(graph, state: ChatState):
                 else:
                     yield {"type": "content", "content": text}
         elif isinstance(chunk, ToolMessage):
+            transaction_result = _format_recent_transactions(chunk)
+            if transaction_result is not None:
+                transaction_results.append(transaction_result)
             financial_event = _validated_financial_event(chunk, state["account_id"])
             if financial_event is not None:
                 financial_events.append(financial_event)
@@ -507,6 +661,9 @@ async def stream_agent_events(graph, state: ChatState):
     elif transfer_events:
         for event in transfer_events:
             yield event
+    elif transaction_results:
+        for result in transaction_results:
+            yield {"type": "content", "content": result}
     elif requires_atomic_response:
         answer = "".join(buffered_content).strip()
         if answer:

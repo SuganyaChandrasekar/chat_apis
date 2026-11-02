@@ -1128,6 +1128,7 @@ def test_langgraph_runs_balance_tool_over_http(monkeypatch) -> None:
     state = orchestrator_agent.initial_chat_state(
         "Check my balance", "trusted-account"
     )
+    state["intent"] = "balance_check"
 
     async def collect_events():
         return [event async for event in orchestrator_agent.stream_agent_events(graph, state)]

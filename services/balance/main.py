@@ -1,6 +1,7 @@
+from datetime import date
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from services.api_errors import register_exception_handlers
 from services.authentication import authenticated_subject
@@ -18,6 +19,8 @@ from services.sandbox import (
     SANDBOX_INITIAL_BALANCES,
     SandboxAccount,
     SandboxBalance,
+    SandboxTransaction,
+    SANDBOX_TRANSACTIONS,
     require_sandbox_mode,
     sandbox_account_status,
 )
@@ -78,6 +81,44 @@ async def get_sandbox_balance(
     return SandboxBalance(
         account_id=account_id, balance=balance, currency=SANDBOX_CURRENCY
     )
+
+
+@app.get(
+    "/accounts/{account_id}/transactions",
+    response_model=list[SandboxTransaction],
+    tags=["sandbox"],
+    dependencies=[Depends(require_sandbox_mode)],
+)
+async def get_sandbox_transactions(
+    account_id: str,
+    limit: int = Query(default=10, ge=1, le=100),
+    date_from: date | None = None,
+    date_to: date | None = None,
+    merchant: str | None = Query(default=None, min_length=1, max_length=128),
+    authenticated_customer_id: str = Depends(authenticated_subject),
+) -> list[SandboxTransaction]:
+    authorized_accounts = SANDBOX_CUSTOMER_ACCOUNTS.get(authenticated_customer_id, ())
+    if account_id not in authorized_accounts:
+        raise HTTPException(status_code=403, detail="Account access is not authorized")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=422, detail="date_from must not be later than date_to"
+        )
+
+    transactions = SANDBOX_TRANSACTIONS.get(account_id)
+    if transactions is None:
+        raise HTTPException(status_code=404, detail="Sandbox account not found")
+    filtered = [
+        transaction
+        for transaction in transactions
+        if (date_from is None or transaction.date >= date_from)
+        and (date_to is None or transaction.date <= date_to)
+        and (
+            merchant is None
+            or merchant.casefold() in transaction.merchant.casefold()
+        )
+    ]
+    return filtered[:limit]
 
 
 @app.get(
