@@ -2,6 +2,7 @@ import os
 import re
 import hmac
 import hashlib
+import math
 from collections.abc import Sequence
 from uuid import UUID, uuid4
 
@@ -104,7 +105,33 @@ def safe_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
             continue
         content = sanitize_content(message.content)
         if isinstance(message, HumanMessage):
-            safe.append(HumanMessage(content=content, id=message.id))
+            metadata = message.additional_kwargs
+            safe_distress_metadata = {}
+            score = metadata.get("sandbox_distress_score")
+            tier = metadata.get("sandbox_distress_tier")
+            requests_human_support = metadata.get(
+                "sandbox_requests_human_support"
+            )
+            if (
+                isinstance(score, (int, float))
+                and not isinstance(score, bool)
+                and math.isfinite(score)
+                and 0.0 <= score <= 1.0
+            ):
+                safe_distress_metadata["sandbox_distress_score"] = float(score)
+            if isinstance(tier, int) and not isinstance(tier, bool) and 0 <= tier <= 4:
+                safe_distress_metadata["sandbox_distress_tier"] = tier
+            if isinstance(requests_human_support, bool):
+                safe_distress_metadata["sandbox_requests_human_support"] = (
+                    requests_human_support
+                )
+            safe.append(
+                HumanMessage(
+                    content=content,
+                    id=message.id,
+                    additional_kwargs=safe_distress_metadata,
+                )
+            )
         elif isinstance(message, AIMessage):
             safe.append(AIMessage(content=content, id=message.id))
     return safe

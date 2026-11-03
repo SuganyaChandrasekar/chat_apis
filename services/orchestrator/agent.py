@@ -74,6 +74,7 @@ class ChatState(MessagesState):
     account_id: str
     tool_states: dict[str, str]
     intent: str
+    distress_tier: int
     transaction_limit: int
     transaction_account_hint: str | None
     transaction_date_hint: str | None
@@ -501,7 +502,22 @@ def initial_chat_state(
     content: str,
     account_id: str,
     prior_messages: list[BaseMessage] | None = None,
+    distress_tier: int = 0,
 ) -> ChatState:
+    modulation = ""
+    if distress_tier >= 1:
+        modulation = (
+            " The latest user turn indicates elevated distress. Respond with "
+            "extra empathy, use short and simple sentences, and do not rush the "
+            "conversation. Avoid judgment and do not minimize the concern."
+        )
+    if distress_tier >= 2:
+        modulation += (
+            " Offer a warm hand-off to a human support specialist. Clearly state "
+            "that accepting the offer will share the user's identity and recent "
+            "conversation transcript with that specialist, and ask them to reply "
+            "yes if they consent."
+        )
     return {
         "messages": add_messages(
             [
@@ -519,6 +535,7 @@ def initial_chat_state(
                         "as a substitute; explain that the earlier value is unavailable "
                         "and offer to check the current balance. If the user clearly asks "
                         "for their current balance, use the balance tool."
+                        + modulation
                     )
                 ),
                 *(prior_messages or []),
@@ -528,6 +545,7 @@ def initial_chat_state(
         "account_id": account_id,
         "tool_states": {},
         "intent": "",
+        "distress_tier": distress_tier,
         "transaction_limit": 10,
         "transaction_account_hint": None,
         "transaction_date_hint": None,

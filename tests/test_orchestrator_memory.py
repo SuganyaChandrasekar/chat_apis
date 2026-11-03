@@ -24,6 +24,27 @@ def test_safe_messages_redacts_secrets_and_drops_message_metadata(monkeypatch):
     assert safe_message.additional_kwargs == {}
 
 
+def test_safe_messages_preserves_only_validated_distress_metadata(monkeypatch):
+    monkeypatch.setattr(memory, "anonymize_message", lambda content: content)
+    message = HumanMessage(
+        content="I need a human specialist.",
+        additional_kwargs={
+            "sandbox_distress_score": 0.72,
+            "sandbox_distress_tier": 2,
+            "sandbox_requests_human_support": True,
+            "access_token": "must-not-persist",
+        },
+    )
+
+    [safe_message] = memory.safe_messages([message])
+
+    assert safe_message.additional_kwargs == {
+        "sandbox_distress_score": 0.72,
+        "sandbox_distress_tier": 2,
+        "sandbox_requests_human_support": True,
+    }
+
+
 def test_owner_key_is_keyed_and_does_not_store_subject(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "test-secret-key-with-at-least-32-bytes")
 

@@ -3,6 +3,7 @@ import logging
 import ipaddress
 import json
 import os
+import re
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from time import time
@@ -14,7 +15,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.websockets import WebSocketDisconnect
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
@@ -30,6 +31,21 @@ from services.orchestrator.cache import (
     is_cacheable_public_intent,
 )
 from services.orchestrator.chat_contracts import ChatMessage
+from services.orchestrator.distress import (
+    DistressClassifierUnavailable,
+    DistressEvaluation,
+    evaluate_distress,
+)
+from services.orchestrator.handoff import (
+    HandoffDeliveryStatus,
+    HandoffPackage,
+    HandoffPackageResponse,
+    HandoffPackageStoreUnavailable,
+    HandoffTranscriptMessage,
+    create_handoff_package,
+    get_handoff_package,
+    new_package_id,
+)
 from services.orchestrator.contracts import (
     AuthenticatedCustomer,
     BalanceIntegrationUnavailable,
@@ -74,6 +90,16 @@ TEST_ACCOUNT_ID = "sandbox-checking-001"
 TEST_SESSION_TTL_SECONDS = 1800
 CONVERSATION_EXPIRATION_INTERVAL_SECONDS = 30
 _GENERIC_BALANCE_REPLY = "I provided the requested account information."
+_HANDOFF_OFFER = (
+    "Would you like me to connect you with a human support specialist? "
+    "Reply yes to share your identity and recent conversation transcript "
+    "with a human support specialist."
+)
+_SANDBOX_CRISIS_CONTACT_DEFAULT = (
+    "If you are in immediate danger or need urgent help, please contact your "
+    "local emergency services immediately or call our 24/7 Specialist Crisis "
+    "Support line at 1-800-ALBION-CRISIS."
+)
 
 
 class ChatIntentClassification(BaseModel):
@@ -111,6 +137,12 @@ class LatestTransferPayload(BaseModel):
 
 class SandboxCardFreezeRequest(BaseModel):
     otp_code: str = Field(pattern=r"^\d{6}$")
+
+
+class HandoffPackageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: UUID
 
 
 def _sandbox_card_service_token(account_id: str) -> str:
@@ -405,6 +437,61 @@ async def forward_sandbox_transfer(
     return JSONResponse(status_code=response.status_code, content=content)
 
 
+@app.post(
+    "/hand-off/package",
+    response_model=HandoffPackageResponse,
+    tags=["sandbox", "hand-off"],
+    dependencies=[Depends(require_sandbox_mode)],
+)
+async def generate_handoff_package(
+    handoff_request: HandoffPackageRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> HandoffPackageResponse:
+    _token, user_id = _authenticated_account_id(
+        authorization, request.cookies.get(TEST_SESSION_COOKIE)
+    )
+    store = _conversation_store(request.app.state)
+    thread_id = await _resolve_conversation(
+        store, user_id, handoff_request.session_id
+    )
+    try:
+        existing = await asyncio.to_thread(
+            get_handoff_package,
+            session_id=str(thread_id),
+            user_id=user_id,
+        )
+    except HandoffPackageStoreUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Hand-off package storage is unavailable"
+        ) from None
+    if existing is not None:
+        return HandoffPackageResponse(
+            **existing.model_dump(),
+            delivery=HandoffDeliveryStatus(),
+        )
+
+    prior_messages = await store.load(thread_id)
+    try:
+        _package, _acknowledgement = await _accept_handoff(
+            store=store,
+            thread_id=thread_id,
+            user_id=user_id,
+            prior_messages=prior_messages,
+            accepted_content=(
+                "I accept the hand-off and consent to share my identity and "
+                "conversation transcript with a human support specialist."
+            ),
+            guardrails=getattr(request.app.state, "guardrails", None),
+        )
+    except HTTPException:
+        raise
+    return HandoffPackageResponse(
+        **_package.model_dump(),
+        delivery=HandoffDeliveryStatus(),
+    )
+
+
 def _authenticated_account_id(
     authorization: str | None, session_token: str | None = None
 ) -> tuple[str, str]:
@@ -428,8 +515,195 @@ def _prepare_message(
     content: str,
     account_id: str,
     prior_messages: Sequence[BaseMessage] | None = None,
+    distress_tier: int = 0,
 ) -> dict:
-    return initial_chat_state(content, account_id, list(prior_messages or []))
+    return initial_chat_state(
+        content,
+        account_id,
+        list(prior_messages or []),
+        distress_tier=distress_tier,
+    )
+
+
+async def _sandbox_distress_evaluation(
+    content: str,
+    prior_messages: Sequence[BaseMessage] = (),
+    *,
+    guardrails: Any | None,
+) -> DistressEvaluation:
+    if os.getenv("SANDBOX_MODE", "false").lower() != "true":
+        return DistressEvaluation(score=0.0, tier=0)
+    return await evaluate_distress(
+        content,
+        prior_messages,
+        rails=guardrails,
+    )
+
+
+def _handoff_offer_is_pending(messages: Sequence[BaseMessage]) -> bool:
+    if not messages or not isinstance(messages[-1], AIMessage):
+        return False
+    content = messages[-1].content
+    return isinstance(content, str) and _HANDOFF_OFFER.casefold() in content.casefold()
+
+
+def _accepts_handoff(content: str) -> bool:
+    normalized = " ".join(content.casefold().strip().split())
+    return normalized.rstrip(".!") in {
+        "yes",
+        "yes please",
+        "i accept",
+        "accept",
+        "connect me",
+        "please connect me",
+        "okay connect me",
+        "ok connect me",
+    }
+
+
+async def _latest_user_distress(
+    messages: Sequence[BaseMessage], *, guardrails: Any | None
+) -> DistressEvaluation:
+    user_messages = [
+        (index, message)
+        for index, message in enumerate(messages)
+        if isinstance(message, HumanMessage) and isinstance(message.content, str)
+    ]
+    if not user_messages:
+        return DistressEvaluation(score=0.0, tier=0)
+    latest_index, latest_message = user_messages[-1]
+    metadata = latest_message.additional_kwargs
+    score = metadata.get("sandbox_distress_score")
+    tier = metadata.get("sandbox_distress_tier")
+    requests_human_support = metadata.get("sandbox_requests_human_support")
+    if (
+        isinstance(score, (int, float))
+        and not isinstance(score, bool)
+        and 0.0 <= score <= 1.0
+        and isinstance(tier, int)
+        and not isinstance(tier, bool)
+        and 0 <= tier <= 4
+        and isinstance(requests_human_support, bool)
+    ):
+        return DistressEvaluation(
+            score=float(score),
+            tier=tier,
+            requests_human_support=requests_human_support,
+        )
+    return await _sandbox_distress_evaluation(
+        latest_message.content,
+        messages[:latest_index],
+        guardrails=guardrails,
+    )
+
+
+async def _accept_handoff(
+    *,
+    store: ConversationStore,
+    thread_id: UUID,
+    user_id: str,
+    prior_messages: Sequence[BaseMessage],
+    accepted_content: str,
+    guardrails: Any | None,
+) -> tuple[HandoffPackage, str]:
+    if not _handoff_offer_is_pending(prior_messages):
+        raise HTTPException(status_code=409, detail="No hand-off offer is pending")
+    try:
+        evaluation = await _latest_user_distress(
+            prior_messages,
+            guardrails=guardrails,
+        )
+    except DistressClassifierUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Distress assessment is unavailable"
+        ) from None
+    if evaluation.tier < 2 and not evaluation.requests_human_support:
+        raise HTTPException(status_code=409, detail="No hand-off offer is pending")
+
+    try:
+        accepted_content = sanitize_content(accepted_content)
+        transcript_messages = [
+            message
+            for message in prior_messages
+            if isinstance(message, (HumanMessage, AIMessage))
+            and isinstance(message.content, str)
+        ]
+        transcript_messages.append(HumanMessage(content=accepted_content))
+        transcript = []
+        for message in transcript_messages[-20:]:
+            content = sanitize_content(message.content)[:4000]
+            if content:
+                transcript.append(
+                    HandoffTranscriptMessage(
+                        role=(
+                            "assistant"
+                            if isinstance(message, AIMessage)
+                            else "user"
+                        ),
+                        content=content,
+                    )
+                )
+    except PiiMaskingUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Hand-off package processing is unavailable"
+        ) from None
+
+    actions_taken = []
+    for message in transcript:
+        for case_id in re.findall(
+            r"\bFRD-\d{4}-[A-F0-9]{8}\b", message.content, re.IGNORECASE
+        ):
+            action = f"fraud_case_created:{case_id.upper()}"
+            if action not in actions_taken:
+                actions_taken.append(action)
+    if any(
+        message.role == "assistant"
+        and re.search(r"\b(?:froze|frozen)\s+(?:your\s+)?card", message.content, re.I)
+        for message in transcript
+    ):
+        actions_taken.append("sandbox_card_freeze_confirmed")
+
+    package = HandoffPackage(
+        package_id=new_package_id(),
+        session_id=str(thread_id),
+        user_id=user_id,
+        transcript=transcript,
+        detected_intent="distress_support",
+        distress_score=evaluation.score,
+        identity_consent_state="consented",
+        actions_taken=actions_taken,
+    )
+    requested_package_id = package.package_id
+    try:
+        package = await asyncio.to_thread(create_handoff_package, package)
+    except HandoffPackageStoreUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Hand-off package storage is unavailable"
+        ) from None
+
+    is_new_package = package.package_id == requested_package_id
+    acknowledgement = (
+        (
+            "Your hand-off request has been recorded in this sandbox. It has "
+            "not been sent to or assigned to a human support specialist. This "
+            "chat session remains available. Your reference is "
+        )
+        if is_new_package
+        else (
+            "Your hand-off request was already recorded in this sandbox. It "
+            "has not been sent to or assigned to a human support specialist. "
+            "This chat session remains available. Your reference is "
+        )
+    ) + package.package_id + "."
+    if is_new_package:
+        await store.append(
+            thread_id,
+            [
+                HumanMessage(content=accepted_content),
+                AIMessage(content=acknowledgement),
+            ],
+        )
+    return package, acknowledgement
 
 
 def _require_chat_model_configuration() -> None:
@@ -586,6 +860,56 @@ async def _stream_response(
         return
 
     try:
+        distress_evaluation = await _sandbox_distress_evaluation(
+            content,
+            prior_messages or (),
+            guardrails=guardrails,
+        )
+    except DistressClassifierUnavailable:
+        yield {"type": "error", "content": "Message processing is unavailable."}
+        yield {"type": "completion"}
+        return
+    if turn_messages is not None:
+        turn_messages.append(
+            HumanMessage(
+                content=content,
+                additional_kwargs={
+                    "sandbox_distress_tier": distress_evaluation.tier,
+                    "sandbox_distress_score": distress_evaluation.score,
+                    "sandbox_requests_human_support": (
+                        distress_evaluation.requests_human_support
+                    ),
+                },
+            )
+        )
+    if distress_evaluation.tier >= 3:
+        contact_text = os.getenv(
+            "SANDBOX_CRISIS_CONTACT_TEXT", _SANDBOX_CRISIS_CONTACT_DEFAULT
+        ).strip()
+        if not contact_text:
+            contact_text = _SANDBOX_CRISIS_CONTACT_DEFAULT
+        yield {
+            "type": "content",
+            "content": (
+                "I’m sorry you’re facing this. Your safety matters. "
+                f"{contact_text}"
+            ),
+        }
+        yield {"type": "completion"}
+        return
+
+    if distress_evaluation.tier >= 1 or distress_evaluation.requests_human_support:
+        response = (
+            "I’m sorry this feels difficult. We can take it one step at a time. "
+            "What would help you most right now?"
+        )
+        if distress_evaluation.tier == 2 or distress_evaluation.requests_human_support:
+            response += " I can also connect you with a human support specialist."
+        yield {"type": "content", "content": response}
+        yield {"type": "completion"}
+        return
+
+    try:
         guardrail_context = [
             {
                 "role": "assistant" if isinstance(message, AIMessage) else "user",
@@ -634,8 +958,6 @@ async def _stream_response(
         yield {"type": "completion"}
         return
 
-    if turn_messages is not None:
-        turn_messages.append(HumanMessage(content=content))
     guardrail_turn_context = [
         *guardrail_context,
         {"role": "user", "content": content},
@@ -991,11 +1313,21 @@ async def _stream_response(
             return
 
     logger.info("Preparing chat message")
-    state = (
-        _prepare_message(content, account_id, prior_messages)
-        if prior_messages
-        else _prepare_message(content, account_id)
-    )
+    if distress_evaluation.tier and prior_messages:
+        state = _prepare_message(
+            content,
+            account_id,
+            prior_messages,
+            distress_tier=distress_evaluation.tier,
+        )
+    elif distress_evaluation.tier:
+        state = _prepare_message(
+            content, account_id, distress_tier=distress_evaluation.tier
+        )
+    elif prior_messages:
+        state = _prepare_message(content, account_id, prior_messages)
+    else:
+        state = _prepare_message(content, account_id)
     state["intent"] = intent.intent
     state["transaction_limit"] = intent.limit
     state["transaction_account_hint"] = intent.account_hint
@@ -1076,6 +1408,64 @@ async def _stream_persisted_response(
     request_path: str = "/chat",
 ):
     prior_messages = await store.load(thread_id)
+    if os.getenv("SANDBOX_MODE", "false").lower() == "true":
+        try:
+            masked_content = sanitize_content(content)
+        except PiiMaskingUnavailable:
+            yield {"type": "error", "content": "Message processing is unavailable."}
+            yield {"type": "completion", "thread_id": str(thread_id)}
+            return
+        if _handoff_offer_is_pending(prior_messages) and _accepts_handoff(
+            masked_content
+        ):
+            try:
+                _package, acknowledgement = await _accept_handoff(
+                    store=store,
+                    thread_id=thread_id,
+                    user_id=account_id,
+                    prior_messages=prior_messages,
+                    accepted_content=masked_content,
+                    guardrails=guardrails,
+                )
+            except HTTPException as error:
+                yield {"type": "error", "content": error.detail}
+                yield {"type": "completion", "thread_id": str(thread_id)}
+                return
+            yield {"type": "content", "content": acknowledgement}
+            yield {"type": "completion", "thread_id": str(thread_id)}
+            return
+        if _accepts_handoff(masked_content):
+            try:
+                existing_package = await asyncio.to_thread(
+                    get_handoff_package,
+                    session_id=str(thread_id),
+                    user_id=account_id,
+                )
+            except HandoffPackageStoreUnavailable:
+                yield {
+                    "type": "error",
+                    "content": "Hand-off package storage is unavailable",
+                }
+                yield {"type": "completion", "thread_id": str(thread_id)}
+                return
+            if existing_package is not None:
+                acknowledgement = (
+                    "Your hand-off request is already recorded in this sandbox. "
+                    "It has not been sent to or assigned to a human support "
+                    "specialist. This chat session remains available. Your "
+                    f"reference is {existing_package.package_id}."
+                )
+                await store.append(
+                    thread_id,
+                    [
+                        HumanMessage(content=masked_content),
+                        AIMessage(content=acknowledgement),
+                    ],
+                )
+                yield {"type": "content", "content": acknowledgement}
+                yield {"type": "completion", "thread_id": str(thread_id)}
+                return
+
     turn_messages: list[BaseMessage] = []
     assistant_content = []
     response_types = set()
@@ -1130,6 +1520,26 @@ async def _stream_persisted_response(
                     f"{', '.join(labels)}."
                 )
         yield event
+
+    distress_tier = next(
+        (
+            message.additional_kwargs.get("sandbox_distress_tier", 0)
+            for message in turn_messages
+            if isinstance(message, HumanMessage)
+        ),
+        0,
+    )
+    handoff_requested = any(
+        isinstance(message, HumanMessage)
+        and message.additional_kwargs.get("sandbox_requests_human_support") is True
+        for message in turn_messages
+    )
+    if (
+        (distress_tier == 2 or handoff_requested)
+        and "error" not in response_types
+    ):
+        assistant_content.append(_HANDOFF_OFFER)
+        yield {"type": "content", "content": _HANDOFF_OFFER}
 
     assistant_reply = "".join(assistant_content)
     if not assistant_reply and "financial" in response_types:
