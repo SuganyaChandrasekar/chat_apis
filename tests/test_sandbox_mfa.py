@@ -20,6 +20,25 @@ def test_sandbox_mfa_accepts_demo_otp(monkeypatch) -> None:
     assert response.json() == {"status": "verified"}
 
 
+def test_sandbox_mfa_accepts_card_freeze_purpose_without_transfer_amount(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SANDBOX_MODE", "true")
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    response = client.post(
+        "/verify-otp",
+        json={
+            "account_id": "usr_sandbox_01",
+            "otp_code": "123456",
+            "purpose": "card_freeze",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "verified"}
+
+
 def test_sandbox_mfa_rejects_invalid_otp(monkeypatch) -> None:
     monkeypatch.setenv("SANDBOX_MODE", "true")
     client = TestClient(app, client=("127.0.0.1", 50000))

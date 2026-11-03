@@ -61,6 +61,7 @@ from services.authentication import (
     validate_access_token,
 )
 from services.sandbox import (
+    SANDBOX_CARD_OWNER_BY_ACCOUNT_ID,
     SANDBOX_CUSTOMER_ACCOUNTS,
     SandboxTransferRequest,
     require_sandbox_mode,
@@ -104,6 +105,22 @@ class ChatIntentClassification(BaseModel):
 class LatestTransferPayload(BaseModel):
     source_account_id: str = Field(min_length=1, max_length=256)
     destination_account_id: str = Field(min_length=1, max_length=256)
+
+
+class SandboxCardFreezeRequest(BaseModel):
+    otp_code: str = Field(pattern=r"^\d{6}$")
+
+
+def _sandbox_card_service_token(account_id: str) -> str:
+    card_user_id = SANDBOX_CARD_OWNER_BY_ACCOUNT_ID.get(account_id)
+    if card_user_id is None:
+        raise HTTPException(status_code=403, detail="Card access is not authorized")
+    try:
+        return create_access_token(card_user_id, ttl_seconds=60)
+    except JwtConfigurationError:
+        raise HTTPException(
+            status_code=503, detail="Authentication is not configured"
+        ) from None
 
 
 def _configured_origins() -> list[str]:
@@ -237,6 +254,94 @@ async def sandbox_test_logout(request: Request, response: Response) -> dict[str,
     )
     response.headers["Cache-Control"] = "no-store"
     return {"status": "signed_out"}
+
+
+@app.get(
+    "/sandbox/cards",
+    tags=["sandbox"],
+    dependencies=[Depends(require_sandbox_mode)],
+)
+async def list_sandbox_cards(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    _token, account_id = _authenticated_account_id(
+        authorization, request.cookies.get(TEST_SESSION_COOKIE)
+    )
+    service_token = _sandbox_card_service_token(account_id)
+    cards_service_url = os.getenv(
+        "CARDS_SERVICE_URL", "http://localhost:8004"
+    ).rstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{cards_service_url}/sandbox/cards",
+                headers={"Authorization": f"Bearer {service_token}"},
+            )
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503, detail="Cards service is unavailable"
+        ) from None
+    try:
+        payload = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502, detail="Invalid response from cards service"
+        ) from None
+    if response.status_code >= 500:
+        raise HTTPException(status_code=503, detail="Cards service is unavailable")
+    return JSONResponse(
+        status_code=response.status_code,
+        content=payload,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post(
+    "/sandbox/cards/{card_id}/freeze",
+    tags=["sandbox"],
+    dependencies=[Depends(require_sandbox_mode)],
+)
+async def freeze_sandbox_card(
+    card_id: str,
+    freeze_request: SandboxCardFreezeRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    _token, account_id = _authenticated_account_id(
+        authorization, request.cookies.get(TEST_SESSION_COOKIE)
+    )
+    service_token = _sandbox_card_service_token(account_id)
+    cards_service_url = os.getenv(
+        "CARDS_SERVICE_URL", "http://localhost:8004"
+    ).rstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{cards_service_url}/sandbox/cards/"
+                f"{quote(card_id, safe='')}/freeze",
+                headers={"Authorization": f"Bearer {service_token}"},
+                json=freeze_request.model_dump(),
+            )
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503, detail="Cards service is unavailable"
+        ) from None
+    try:
+        payload = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502, detail="Invalid response from cards service"
+        ) from None
+    if response.status_code >= 500:
+        raise HTTPException(status_code=503, detail="Cards service is unavailable")
+    return JSONResponse(
+        status_code=response.status_code,
+        content=payload,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/balance", tags=["balance"])

@@ -58,6 +58,9 @@ SANDBOX_ACCOUNT_LABELS = {
     "sandbox-savings-001": "Savings account",
 }
 SANDBOX_CURRENCY = "USD"
+SANDBOX_CARD_OWNER_BY_ACCOUNT_ID = {
+    "sandbox-checking-001": "usr_sandbox_01",
+}
 _SANDBOX_TRANSACTION_DATE = date.today()
 SANDBOX_TRANSACTIONS: dict[str, tuple[SandboxTransaction, ...]] = {
     "sandbox-checking-001": (

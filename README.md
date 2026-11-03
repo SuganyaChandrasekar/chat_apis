@@ -1,10 +1,11 @@
 # Banking Chatbot Services
 
-This repository contains three independently deployable FastAPI services:
+This repository contains independently deployable FastAPI services:
 
 - `orchestrator`: public chat/API entry point, intended for LangGraph routing.
 - `balance`: private balance-query service.
 - `transfer`: private transfer workflow service.
+- `cards`: sandbox card-management service.
 
 ## Run locally
 
@@ -24,6 +25,7 @@ Run each service in a separate terminal after activating the virtual environment
 python -m uvicorn services.orchestrator.main:app --reload --port 8000
 python -m uvicorn services.balance.main:app --reload --port 8001
 python -m uvicorn services.transfer.main:app --reload --port 8002
+python -m uvicorn services.cards.main:app --reload --port 8004
 python -m uvicorn services.mfa.main:app --reload --port 8003 --env-file .env
 ```
 
@@ -78,9 +80,9 @@ The LangGraph agent registers `check_balance`, `prepare_transfer`, and `get_rece
 
 The sandbox-only balance service provides `GET /accounts/{account_id}/transactions` when `SANDBOX_MODE=true`. It returns static checking and savings fixtures, requires a valid bearer token and account entitlement, and accepts `limit` (1–100, default 10), `date_from`, `date_to`, and case-insensitive partial `merchant` filters. This endpoint is mock data only and is not connected to a production ledger.
 
-Set `SANDBOX_MODE=true` for the balance, transfer, and orchestrator services to enable their sandbox routes. After the user confirms the preview, the UI posts to the orchestrator's `POST /transfer`, which forwards the user's validated token and `Idempotency-Key` to `{TRANSFER_SERVICE_URL}/transfer` (default `http://localhost:8002`). The transfer service validates that both accounts belong to the authenticated customer, requires `confirmed: true`, and verifies `otp_code` with `MFA_VERIFICATION_URL` (default `http://localhost:8003/verify-otp`) only when the amount is at least `HIGH_VALUE_TRANSFER_THRESHOLD` (default `1000.00`). It rejects frozen source accounts and returns the available balance with an `INSUFFICIENT_FUNDS` refusal. Set `SANDBOX_FROZEN_ACCOUNT_IDS` to a comma-separated list to mark sandbox accounts frozen during local testing. It appends `PENDING_VALIDATION` then `SUCCESS` or `FAILED` rows to PostgreSQL. The authenticated `GET /transfers/latest` route returns account IDs from the most recent successful transfer; the orchestrator resolves labels from the authenticated balance service's authorized account list for contextual chat follow-ups. Configure `DATABASE_URL` and apply the schema with `alembic upgrade head` before accepting transfers.
+Set `SANDBOX_MODE=true` for the balance, transfer, cards, and orchestrator services to enable their sandbox routes. After the user confirms the preview, the UI posts to the orchestrator's `POST /transfer`, which forwards the user's validated token and `Idempotency-Key` to `{TRANSFER_SERVICE_URL}/transfer` (default `http://localhost:8002`). The transfer service validates that both accounts belong to the authenticated customer, requires `confirmed: true`, and verifies `otp_code` with `MFA_VERIFICATION_URL` (default `http://localhost:8003/verify-otp`) only when the amount is at least `HIGH_VALUE_TRANSFER_THRESHOLD` (default `1000.00`). It rejects frozen source accounts and returns the available balance with an `INSUFFICIENT_FUNDS` refusal. Set `SANDBOX_FROZEN_ACCOUNT_IDS` to a comma-separated list to mark sandbox accounts frozen during local testing. It appends `PENDING_VALIDATION` then `SUCCESS` or `FAILED` rows to PostgreSQL. The authenticated `GET /transfers/latest` route returns account IDs from the most recent successful transfer; the orchestrator resolves labels from the authenticated balance service's authorized account list for contextual chat follow-ups. Configure `DATABASE_URL` and apply the schema with `alembic upgrade head` before accepting transfers.
 
-The MFA service is a local sandbox test verifier only. Start it with `SANDBOX_MODE=true`; it accepts the demo OTP `123456` and only allows loopback clients. It does not generate or store OTPs and must not be used outside local sandbox testing.
+The MFA service is a local sandbox test verifier only. Start it with `SANDBOX_MODE=true`; it accepts the demo OTP `123456` and only allows loopback clients. It does not generate or store OTPs and must not be used outside local sandbox testing. The Cards service is also sandbox-only: authenticated user `usr_sandbox_01` owns two seeded card records in PostgreSQL. Apply migrations with `alembic upgrade head` before starting the service. `GET /sandbox/cards` lists that user's cards, while `POST /sandbox/cards/{card_id}/freeze` requires the demo OTP through `MFA_VERIFICATION_URL` before persisting the status change. The response includes the card name, last four digits, timestamp, and reference ID. `POST /sandbox/cards/{card_id}/reset` restores an owned card to `active` for sandbox testing. In the UI, requests to freeze or block a card open a card-selection and OTP form; the OTP is submitted over the authenticated orchestrator API and is not sent in chat. The orchestrator maps the sandbox login account to its card user server-side and proxies to `CARDS_SERVICE_URL` (default `http://localhost:8004`). A trusted fraud workflow can call `freeze_card_for_fraud(user_id, card_id)` internally to persistently freeze an owned card immediately without a separate user prompt; no public request flag exposes this bypass.
 
 The included account balances and ledger are still in-memory sandbox fixtures, not live core-banking data. This sandbox transfer tool supports transfers between the customer's linked accounts only; external payees such as Alice require a payee directory and transfer-service contract that are not present here. Confirmation and OTP are collected by the UI and are never generated by the model. Production use still requires a trusted account-data/transfer backend; sandbox mode must not be enabled in production.
 
