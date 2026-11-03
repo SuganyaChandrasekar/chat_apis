@@ -45,6 +45,16 @@ class CardFreezeResponse(BaseModel):
     message: str
 
 
+class FraudFreezeRequest(BaseModel):
+    card_ids: list[str] | None = Field(default=None, max_length=20)
+
+
+class FraudFreezeResponse(BaseModel):
+    frozen_card_ids: list[str]
+    newly_frozen_card_ids: list[str]
+    already_frozen_card_ids: list[str]
+
+
 def _card_response(card: CardRecord) -> CardResponse:
     return CardResponse(
         card_id=card.card_id,
@@ -180,6 +190,51 @@ async def freeze_sandbox_card(
     )
     card = await _set_owned_card_status(authenticated_user_id, card_id, "frozen")
     return _freeze_response(card)
+
+
+@app.post(
+    "/sandbox/fraud/freeze",
+    response_model=FraudFreezeResponse,
+    tags=["sandbox", "fraud"],
+    dependencies=[Depends(require_sandbox_mode)],
+)
+async def freeze_fraud_cards(
+    request: FraudFreezeRequest,
+    authenticated_user_id: str = Depends(authenticated_subject),
+) -> FraudFreezeResponse:
+    if request.card_ids is not None and any(
+        not card_id or len(card_id) > 128 for card_id in request.card_ids
+    ):
+        raise HTTPException(status_code=422, detail="Invalid card identifier")
+
+    try:
+        cards = await asyncio.to_thread(list_user_cards, authenticated_user_id)
+    except CardStoreUnavailable:
+        raise HTTPException(status_code=503, detail="Card storage is unavailable") from None
+
+    owned_cards = {card.card_id: card for card in cards}
+    if request.card_ids is None:
+        target_ids = [card.card_id for card in cards]
+    else:
+        target_ids = list(dict.fromkeys(request.card_ids))
+        if not target_ids or any(card_id not in owned_cards for card_id in target_ids):
+            raise HTTPException(status_code=404, detail="Card not found")
+
+    frozen_card_ids = []
+    newly_frozen_card_ids = []
+    already_frozen_card_ids = []
+    for card_id in target_ids:
+        if owned_cards[card_id].status == "active":
+            await freeze_card_for_fraud(authenticated_user_id, card_id)
+            newly_frozen_card_ids.append(card_id)
+        else:
+            already_frozen_card_ids.append(card_id)
+        frozen_card_ids.append(card_id)
+    return FraudFreezeResponse(
+        frozen_card_ids=frozen_card_ids,
+        newly_frozen_card_ids=newly_frozen_card_ids,
+        already_frozen_card_ids=already_frozen_card_ids,
+    )
 
 
 @app.post(

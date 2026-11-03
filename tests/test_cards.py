@@ -205,6 +205,57 @@ def test_fraud_workflow_freezes_owned_card_without_user_mfa() -> None:
     assert _card_status("card_credit_8899") == "frozen"
 
 
+def test_sandbox_fraud_route_freezes_all_cards_without_mfa() -> None:
+    response = TestClient(cards_main.app).post(
+        "/sandbox/fraud/freeze",
+        headers=_authorization(),
+        json={"card_ids": None},
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()["frozen_card_ids"]) == {
+        "card_debit_4321",
+        "card_credit_8899",
+    }
+    assert set(response.json()["newly_frozen_card_ids"]) == {
+        "card_debit_4321",
+        "card_credit_8899",
+    }
+    assert response.json()["already_frozen_card_ids"] == []
+    assert _card_status("card_debit_4321") == "frozen"
+    assert _card_status("card_credit_8899") == "frozen"
+
+
+def test_sandbox_fraud_route_reports_cards_that_were_already_frozen() -> None:
+    cards_store.set_card_status("usr_sandbox_01", "card_debit_4321", "frozen")
+    response = TestClient(cards_main.app).post(
+        "/sandbox/fraud/freeze",
+        headers=_authorization(),
+        json={"card_ids": None},
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()["frozen_card_ids"]) == {
+        "card_debit_4321",
+        "card_credit_8899",
+    }
+    assert response.json()["newly_frozen_card_ids"] == ["card_credit_8899"]
+    assert response.json()["already_frozen_card_ids"] == ["card_debit_4321"]
+
+
+def test_sandbox_fraud_route_freezes_only_the_named_owned_card() -> None:
+    response = TestClient(cards_main.app).post(
+        "/sandbox/fraud/freeze",
+        headers=_authorization(),
+        json={"card_ids": ["card_credit_8899"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["frozen_card_ids"] == ["card_credit_8899"]
+    assert _card_status("card_debit_4321") == "active"
+    assert _card_status("card_credit_8899") == "frozen"
+
+
 def test_fraud_workflow_bypass_is_unavailable_outside_sandbox(monkeypatch) -> None:
     monkeypatch.setenv("SANDBOX_MODE", "false")
 

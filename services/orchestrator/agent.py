@@ -20,6 +20,8 @@ from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, ValidationError
 
+from services.orchestrator.fraud import report_sandbox_fraud
+
 logger = logging.getLogger("uvicorn.error")
 
 HIGH_VALUE_TRANSFER_THRESHOLD = Decimal(
@@ -76,6 +78,7 @@ class ChatState(MessagesState):
     transaction_account_hint: str | None
     transaction_date_hint: str | None
     transaction_merchant_hint: str | None
+    fraud_card_hint: str | None
 
 
 def append_conversation_message(state: ChatState, message: BaseMessage) -> None:
@@ -417,6 +420,18 @@ def build_agent_graph(access_token: str, account_id: str):
         logger.info("Gemini response received")
         return {"messages": [answer]}
 
+    async def risk_distress(state: ChatState) -> dict:
+        latest_message = state["messages"][-1]
+        if not isinstance(latest_message, HumanMessage):
+            raise ValueError("Fraud report requires a latest user message")
+        answer = await report_sandbox_fraud(
+            access_token=access_token,
+            account_id=account_id,
+            reason=str(latest_message.content),
+            card_hint=state.get("fraud_card_hint"),
+        )
+        return {"messages": [AIMessage(content=answer)]}
+
     async def run_tools(state: ChatState) -> dict:
         states = dict(state.get("tool_states", {}))
         latest_message = state["messages"][-1]
@@ -466,10 +481,17 @@ def build_agent_graph(access_token: str, account_id: str):
         latest_message = state["messages"][-1]
         return "tools" if getattr(latest_message, "tool_calls", []) else END
 
+    def route_entry(state: ChatState) -> str:
+        return "risk_distress" if state.get("intent") == "fraud_report" else "agent"
+
     workflow = StateGraph(ChatState)
     workflow.add_node("agent", call_model)
     workflow.add_node("tools", run_tools)
-    workflow.set_entry_point("agent")
+    workflow.add_node("risk_distress", risk_distress)
+    workflow.set_conditional_entry_point(
+        route_entry,
+        {"risk_distress": "risk_distress", "agent": "agent"},
+    )
     workflow.add_conditional_edges("agent", route_after_agent)
     workflow.add_edge("tools", "agent")
     return workflow.compile()
@@ -510,6 +532,7 @@ def initial_chat_state(
         "transaction_account_hint": None,
         "transaction_date_hint": None,
         "transaction_merchant_hint": None,
+        "fraud_card_hint": None,
     }
 
 
@@ -623,6 +646,17 @@ def _format_recent_transactions(tool_message: ToolMessage) -> str | None:
 
 
 async def stream_agent_events(graph, state: ChatState):
+    if state.get("intent") == "fraud_report":
+        result = await graph.ainvoke(state)
+        latest_message = result["messages"][-1]
+        if not isinstance(latest_message, AIMessage) or not isinstance(
+            latest_message.content, str
+        ):
+            raise ValueError("Fraud workflow returned an invalid response")
+        yield {"type": "content", "content": latest_message.content}
+        yield {"type": "completion"}
+        return
+
     buffered_content = []
     financial_events = []
     transfer_events = []
