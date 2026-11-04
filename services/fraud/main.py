@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.api_errors import register_exception_handlers
-from services.authentication import authenticated_subject
+from services.authentication import require_scope
 from services.cards.store import CardStoreUnavailable, get_owned_card
 from services.fraud.store import (
     FraudCaseIdempotencyConflict,
@@ -65,7 +65,7 @@ async def health_check() -> dict[str, str]:
 )
 async def open_fraud_case(
     request: FraudCaseRequest,
-    user_id: str = Depends(authenticated_subject),
+    user_id: str = Depends(require_scope("fraud:report")),
     idempotency_key: Annotated[
         str | None, Header(alias="Idempotency-Key", min_length=1, max_length=128)
     ] = None,

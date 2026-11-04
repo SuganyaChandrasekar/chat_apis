@@ -4,7 +4,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from services.api_errors import register_exception_handlers
-from services.authentication import authenticated_subject
+from services.authentication import require_scope
 from services.balance.contracts import (
     AuthenticatedCustomer,
     BalanceIntegrationUnavailable,
@@ -70,7 +70,7 @@ async def get_balance(
 )
 async def get_sandbox_balance(
     account_id: str,
-    authenticated_account_id: str = Depends(authenticated_subject),
+    authenticated_account_id: str = Depends(require_scope("account:read")),
 ) -> SandboxBalance:
     authorized_accounts = SANDBOX_CUSTOMER_ACCOUNTS.get(authenticated_account_id, ())
     if account_id not in authorized_accounts:
@@ -95,7 +95,7 @@ async def get_sandbox_transactions(
     date_from: date | None = None,
     date_to: date | None = None,
     merchant: str | None = Query(default=None, min_length=1, max_length=128),
-    authenticated_customer_id: str = Depends(authenticated_subject),
+    authenticated_customer_id: str = Depends(require_scope("transactions:read")),
 ) -> list[SandboxTransaction]:
     authorized_accounts = SANDBOX_CUSTOMER_ACCOUNTS.get(authenticated_customer_id, ())
     if account_id not in authorized_accounts:
@@ -128,7 +128,7 @@ async def get_sandbox_transactions(
     dependencies=[Depends(require_sandbox_mode)],
 )
 async def list_sandbox_accounts(
-    authenticated_customer_id: str = Depends(authenticated_subject),
+    authenticated_customer_id: str = Depends(require_scope("account:read")),
 ) -> list[SandboxAccount]:
     authorized_accounts = SANDBOX_CUSTOMER_ACCOUNTS.get(authenticated_customer_id)
     if authorized_accounts is None:

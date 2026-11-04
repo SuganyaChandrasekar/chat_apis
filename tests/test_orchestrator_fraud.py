@@ -2,6 +2,7 @@ import asyncio
 
 from langchain_core.messages import AIMessage
 
+from services.authentication import create_access_token
 from services.orchestrator import agent, fraud, main
 
 
@@ -27,6 +28,9 @@ def test_chat_classifier_detects_scam_reports_semantically() -> None:
 def test_langgraph_routes_fraud_reports_to_the_risk_distress_action(
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("SANDBOX_MODE", "true")
+    monkeypatch.setenv("JWT_SECRET", "orchestrator-fraud-test-secret-32")
+    monkeypatch.setattr(agent, "record_authorization_decision", lambda **kwargs: None)
     recorded = []
 
     async def report_sandbox_fraud(**kwargs):
@@ -40,7 +44,14 @@ def test_langgraph_routes_fraud_reports_to_the_risk_distress_action(
     )
     state["intent"] = "fraud_report"
     state["fraud_card_hint"] = "debit"
-    graph = agent.build_agent_graph("verified-token", "sandbox-checking-001")
+    token = create_access_token(
+        "sandbox-checking-001",
+        scopes=("fraud:report",),
+        consent_state="not_required",
+        sca_state="not_required",
+        token_kind="delegated",
+    )
+    graph = agent.build_agent_graph(token, "sandbox-checking-001")
 
     events = asyncio.run(_collect(agent.stream_agent_events(graph, state)))
 
@@ -49,7 +60,7 @@ def test_langgraph_routes_fraud_reports_to_the_risk_distress_action(
     assert events[-1]["type"] == "completion"
     assert recorded == [
         {
-            "access_token": "verified-token",
+            "access_token": token,
             "account_id": "sandbox-checking-001",
             "reason": "I've been scammed",
             "card_hint": "debit",

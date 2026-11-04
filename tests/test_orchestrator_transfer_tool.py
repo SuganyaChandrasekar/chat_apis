@@ -10,6 +10,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from services.authentication import create_access_token
 from services.orchestrator import agent
 
 
@@ -162,8 +163,17 @@ def test_conversation_history_is_bounded() -> None:
 
 
 def test_prepare_transfer_is_registered_and_streamed_as_confirmation(monkeypatch) -> None:
-    token = "validated-test-token"
     account_id = "sandbox-checking-001"
+    monkeypatch.setattr(agent, "record_authorization_decision", lambda **kwargs: None)
+    monkeypatch.setenv("SANDBOX_MODE", "true")
+    monkeypatch.setenv("JWT_SECRET", "orchestrator-transfer-test-secret-32")
+    token = create_access_token(
+        account_id,
+        scopes=("account:read", "transfer:prepare"),
+        consent_state="not_required",
+        sca_state="not_required",
+        token_kind="delegated",
+    )
     monkeypatch.setenv("BALANCE_SERVICE_URL", "http://balance.test")
     accounts = [
         {"account_id": "sandbox-checking-001", "label": "Checking account"},

@@ -9,7 +9,19 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from services.api_errors import register_exception_handlers
-from services.authentication import authenticated_subject
+from services.authentication import (
+    AuthorizationDenied,
+    InvalidAccessToken,
+    JwtConfigurationError,
+    bearer_token,
+    exchange_access_token,
+    require_scope,
+)
+from services.authorization import (
+    InvalidScaAttestation,
+    card_freeze_action_id,
+    validate_sca_attestation,
+)
 from services.cards.store import (
     CardRecord,
     CardStoreUnavailable,
@@ -107,8 +119,34 @@ def _freeze_response(card: CardRecord) -> CardFreezeResponse:
 
 
 async def _verify_freeze_otp(
-    user_id: str, otp_code: str, authorization: str | None
+    user_id: str,
+    card_id: str,
+    otp_code: str,
+    authorization: str | None,
 ) -> None:
+    action_id = card_freeze_action_id(subject=user_id, card_id=card_id)
+    try:
+        token = exchange_access_token(
+            bearer_token(authorization),
+            scopes=("cards:freeze",),
+            consent_state="granted",
+            consent_action=action_id,
+            sca_state="required",
+        )
+    except JwtConfigurationError:
+        raise HTTPException(
+            status_code=503, detail="Authentication is not configured"
+        ) from None
+    except InvalidAccessToken:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+    except AuthorizationDenied:
+        raise HTTPException(
+            status_code=403, detail="Card freeze permission is not granted"
+        ) from None
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
@@ -116,11 +154,13 @@ async def _verify_freeze_otp(
                     "MFA_VERIFICATION_URL",
                     "http://localhost:8003/verify-otp",
                 ),
-                headers={"Authorization": authorization or ""},
+                headers={"Authorization": f"Bearer {token}"},
                 json={
                     "account_id": user_id,
                     "otp_code": otp_code,
                     "purpose": "card_freeze",
+                    "transaction_id": card_id,
+                    "action_id": action_id,
                 },
             )
     except httpx.RequestError:
@@ -134,10 +174,33 @@ async def _verify_freeze_otp(
         ) from None
     if response.status_code >= 500:
         raise HTTPException(status_code=503, detail="MFA service is unavailable")
-    if not response.is_success or not (
-        isinstance(payload, dict) and payload.get("status") == "verified"
-    ):
+    if not response.is_success or not isinstance(payload, dict) or payload.get("status") != "verified":
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Strong authentication failed. The card was not frozen; retry "
+                "verification or cancel."
+            ),
+        )
+    sca_token = payload.get("sca_token")
+    if not isinstance(sca_token, str):
         raise HTTPException(status_code=401, detail="MFA verification failed")
+    try:
+        validate_sca_attestation(
+            sca_token,
+            subject=user_id,
+            action_id=action_id,
+            transaction_id=card_id,
+            purpose="card_freeze",
+        )
+    except InvalidScaAttestation:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Strong authentication failed. The card was not frozen; retry "
+                "verification or cancel."
+            ),
+        ) from None
 
 
 async def freeze_card_for_fraud(user_id: str, card_id: str) -> CardFreezeResponse:
@@ -159,7 +222,7 @@ async def health_check() -> dict[str, str]:
     dependencies=[Depends(require_sandbox_mode)],
 )
 async def list_sandbox_cards(
-    authenticated_user_id: str = Depends(authenticated_subject),
+    authenticated_user_id: str = Depends(require_scope("cards:read")),
 ) -> list[CardResponse]:
     try:
         cards = await asyncio.to_thread(list_user_cards, authenticated_user_id)
@@ -178,13 +241,20 @@ async def freeze_sandbox_card(
     card_id: str,
     request: CardFreezeRequest,
     authorization: str | None = Header(default=None),
-    authenticated_user_id: str = Depends(authenticated_subject),
+    authenticated_user_id: str = Depends(require_scope("cards:freeze")),
 ) -> CardFreezeResponse:
     await _owned_card_or_404(authenticated_user_id, card_id)
     if not request.otp_code:
-        raise HTTPException(status_code=401, detail="MFA verification is required")
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Strong authentication is required. The card was not frozen; "
+                "retry verification or cancel."
+            ),
+        )
     await _verify_freeze_otp(
         authenticated_user_id,
+        card_id,
         request.otp_code,
         authorization,
     )
@@ -200,7 +270,7 @@ async def freeze_sandbox_card(
 )
 async def freeze_fraud_cards(
     request: FraudFreezeRequest,
-    authenticated_user_id: str = Depends(authenticated_subject),
+    authenticated_user_id: str = Depends(require_scope("fraud:respond")),
 ) -> FraudFreezeResponse:
     if request.card_ids is not None and any(
         not card_id or len(card_id) > 128 for card_id in request.card_ids
@@ -245,7 +315,7 @@ async def freeze_fraud_cards(
 )
 async def reset_sandbox_card(
     card_id: str,
-    authenticated_user_id: str = Depends(authenticated_subject),
+    authenticated_user_id: str = Depends(require_scope("cards:freeze")),
 ) -> CardResponse:
     card = await _set_owned_card_status(authenticated_user_id, card_id, "active")
     return _card_response(card)

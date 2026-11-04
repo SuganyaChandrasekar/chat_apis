@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from services.authentication import create_access_token
 from services.orchestrator import guardrails
 from services.orchestrator import main as orchestrator_main
 from services.orchestrator.pii import PiiMaskingUnavailable
@@ -14,6 +15,23 @@ _REAL_CLASSIFY_CHAT_INTENT = orchestrator_main._classify_chat_intent
 
 @pytest.fixture(autouse=True)
 def allow_other_chat_intents_by_default(monkeypatch):
+    monkeypatch.setenv("SANDBOX_MODE", "false")
+    monkeypatch.setenv("JWT_SECRET", "guardrail-tests-secret-at-least-32-bytes")
+    monkeypatch.setattr(
+        orchestrator_main,
+        "exchange_access_token",
+        lambda _token, *, scopes, consent_state, sca_state: create_access_token(
+            "account-123",
+            scopes=scopes,
+            consent_state=consent_state,
+            sca_state=sca_state,
+            token_kind="delegated",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "record_authorization_decision", lambda **kwargs: None
+    )
+
     async def classify_intent(rails, content, context):
         return orchestrator_main.ChatIntentClassification(intent="other")
 
@@ -710,7 +728,7 @@ def test_last_transfer_question_reads_authenticated_transfer_service(monkeypatch
             return False
 
         async def get(self, url, headers):
-            assert headers == {"Authorization": "Bearer token"}
+            assert headers["Authorization"].startswith("Bearer ")
             if url == "http://transfer.test/transfers/latest":
                 return httpx.Response(
                     200,

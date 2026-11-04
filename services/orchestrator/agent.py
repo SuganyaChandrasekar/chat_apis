@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -21,12 +22,18 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, ValidationError
 
 from services.orchestrator.fraud import report_sandbox_fraud
+from services.authentication import (
+    AuthorizationDenied,
+    InvalidAccessToken,
+    authorize_access_token,
+)
+from services.authorization import (
+    HIGH_VALUE_TRANSFER_THRESHOLD,
+    record_authorization_decision,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
-HIGH_VALUE_TRANSFER_THRESHOLD = Decimal(
-    os.getenv("HIGH_VALUE_TRANSFER_THRESHOLD", "1000.00")
-)
 MAX_CONVERSATION_MESSAGES = 20
 
 class BalanceFinancialPayload(BaseModel):
@@ -80,6 +87,9 @@ class ChatState(MessagesState):
     transaction_date_hint: str | None
     transaction_merchant_hint: str | None
     fraud_card_hint: str | None
+    authorization_scope: str
+    consent_state: str
+    sca_state: str
 
 
 def append_conversation_message(state: ChatState, message: BaseMessage) -> None:
@@ -422,6 +432,68 @@ def build_agent_graph(access_token: str, account_id: str):
         return {"messages": [answer]}
 
     async def risk_distress(state: ChatState) -> dict:
+        try:
+            context = authorize_access_token(
+                access_token,
+                required_scope="fraud:report",
+            )
+        except (AuthorizationDenied, InvalidAccessToken):
+            await asyncio.to_thread(
+                record_authorization_decision,
+                subject=account_id,
+                request_path="/chat",
+                scope="fraud:report",
+                decision="deny",
+                consent_state="not_granted",
+                sca_state="not_performed",
+                action="fraud_report",
+            )
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "This fraud-report action is not authorized for the "
+                            "current session."
+                        )
+                    )
+                ]
+            }
+        if (
+            context.subject != account_id
+            or context.token_kind != "delegated"
+            or context.consent_state != "not_required"
+            or context.sca_state != "not_required"
+        ):
+            await asyncio.to_thread(
+                record_authorization_decision,
+                subject=account_id,
+                request_path="/chat",
+                scope="fraud:report",
+                decision="deny",
+                consent_state=context.consent_state,
+                sca_state=context.sca_state,
+                action="fraud_report",
+            )
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "This fraud-report action is not authorized for the "
+                            "current session."
+                        )
+                    )
+                ]
+            }
+        await asyncio.to_thread(
+            record_authorization_decision,
+            subject=context.subject,
+            request_path="/chat",
+            scope="fraud:report",
+            decision="allow",
+            consent_state=context.consent_state,
+            sca_state=context.sca_state,
+            action="fraud_report",
+        )
         latest_message = state["messages"][-1]
         if not isinstance(latest_message, HumanMessage):
             raise ValueError("Fraud report requires a latest user message")
@@ -448,6 +520,34 @@ def build_agent_graph(access_token: str, account_id: str):
             else:
                 logger.info("Executing agent tool %s", call["name"])
                 try:
+                    required_scope = {
+                        "check_balance": "account:read",
+                        "prepare_transfer": "transfer:prepare",
+                        "get_recent_transactions": "transactions:read",
+                    }.get(call["name"])
+                    if required_scope is None:
+                        raise AuthorizationDenied
+                    context = authorize_access_token(
+                        access_token,
+                        required_scope=required_scope,
+                    )
+                    if (
+                        context.subject != account_id
+                        or context.token_kind != "delegated"
+                        or context.consent_state != "not_required"
+                        or context.sca_state != "not_required"
+                    ):
+                        raise AuthorizationDenied
+                    await asyncio.to_thread(
+                        record_authorization_decision,
+                        subject=context.subject,
+                        request_path="/chat",
+                        scope=required_scope,
+                        decision="allow",
+                        consent_state=context.consent_state,
+                        sca_state=context.sca_state,
+                        action=call["name"],
+                    )
                     tool_args = dict(call["args"])
                     if call["name"] == "get_recent_transactions":
                         tool_args.update(
@@ -463,6 +563,23 @@ def build_agent_graph(access_token: str, account_id: str):
                     result = await registered_tool.ainvoke(tool_args)
                     states[call_id] = "completed"
                     logger.info("Agent tool %s completed", call["name"])
+                except (AuthorizationDenied, InvalidAccessToken):
+                    await asyncio.to_thread(
+                        record_authorization_decision,
+                        subject=account_id,
+                        request_path="/chat",
+                        scope=(
+                            required_scope
+                            if required_scope is not None
+                            else "unknown"
+                        ),
+                        decision="deny",
+                        consent_state="not_granted",
+                        sca_state="not_performed",
+                        action=call["name"],
+                    )
+                    result = "This action is not authorized for the current session."
+                    states[call_id] = "failed"
                 except Exception:
                     result = "Requested service is unavailable."
                     states[call_id] = "failed"
@@ -551,6 +668,9 @@ def initial_chat_state(
         "transaction_date_hint": None,
         "transaction_merchant_hint": None,
         "fraud_card_hint": None,
+        "authorization_scope": "chat:respond",
+        "consent_state": "not_granted",
+        "sca_state": "not_performed",
     }
 
 
@@ -606,11 +726,17 @@ def _validated_transfer_event(tool_message: ToolMessage, account_id: str) -> dic
         logger.warning("Ignoring transfer preparation with an invalid MFA threshold")
         return None
 
+    message = (
+        "Please review and confirm this transfer. Strong authentication will be "
+        "required before execution."
+        if payload.mfa_required
+        else "Please review and confirm this transfer."
+    )
     return {
         "type": "transfer",
         "transaction_id": payload.request_id,
         "status": "PENDING_CONFIRMATION",
-        "message": "Please review and confirm this transfer.",
+        "message": message,
         "mfa_required": payload.mfa_required,
         "transfer": {
             "source_account_id": payload.source_account_id,
@@ -620,7 +746,7 @@ def _validated_transfer_event(tool_message: ToolMessage, account_id: str) -> dic
             "amount": f"{payload.amount:.2f}",
             "currency": payload.currency,
         },
-        "content": "Please review and confirm this transfer.",
+        "content": message,
     }
 
 

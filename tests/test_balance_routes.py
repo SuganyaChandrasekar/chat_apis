@@ -11,6 +11,12 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from services import sandbox
+from services.authentication import (
+    SANDBOX_SCOPES,
+    bearer_token,
+    create_access_token,
+    validate_access_context,
+)
 from services.balance.contracts import AuthenticatedCustomer as BalanceCustomer
 from services.balance.main import (
     app as balance_app,
@@ -38,8 +44,20 @@ async def _allow_advice_boundary(*args, **kwargs):
     }
 
 
+def _sandbox_access_token(monkeypatch, subject="sandbox-checking-001") -> str:
+    monkeypatch.setenv("JWT_SECRET", "balance-routes-test-secret-at-least-32")
+    return create_access_token(subject, scopes=SANDBOX_SCOPES)
+
+
 @pytest.fixture(autouse=True)
 def classify_other_intents_by_default(monkeypatch):
+    monkeypatch.setenv("SANDBOX_MODE", "false")
+    monkeypatch.setattr(
+        orchestrator_main, "record_authorization_decision", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator_agent, "record_authorization_decision", lambda **kwargs: None
+    )
     async def classify_intent(rails, content, context):
         return orchestrator_main.ChatIntentClassification(intent="other")
 
@@ -362,7 +380,12 @@ def test_transfer_rejects_unverified_otp_without_mutating_balance(monkeypatch) -
     )
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "MFA verification failed"}
+    assert response.json() == {
+        "detail": (
+            "Strong customer authentication failed. No transfer was made; "
+            "retry verification or cancel."
+        )
+    }
     assert audit_events == ["FAILED"]
     assert transfer_service.balances["sandbox-checking-001"] == Decimal("1500.00")
 
@@ -497,10 +520,15 @@ def test_orchestrator_forwards_transfer_with_jwt_and_idempotency(monkeypatch) ->
 
         async def post(self, url, headers, json):
             assert url == "http://transfer.test/transfer"
-            assert headers == {
-                "Authorization": f"Bearer {token}",
-                "Idempotency-Key": "request-123",
-            }
+            context = validate_access_context(
+                bearer_token(headers["Authorization"])
+            )
+            assert context.subject == "sandbox-checking-001"
+            assert context.scopes == frozenset({"transfer:execute"})
+            assert context.consent_state == "granted"
+            assert context.consent_action
+            assert context.sca_state == "not_required"
+            assert headers["Idempotency-Key"] == "request-123"
             assert json["source_account_id"] == "sandbox-savings-001"
             assert json["confirmed"] is True
             return httpx.Response(200, json={"transaction_id": "transaction-123"})
@@ -528,6 +556,7 @@ def test_orchestrator_forwards_transfer_with_jwt_and_idempotency(monkeypatch) ->
 
 
 def test_app_lifespan_initializes_guardrails_before_requests(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     initialized = False
     guardrails = object()
 
@@ -552,21 +581,8 @@ def test_chat_sse_masks_message_and_streams_graph_events(monkeypatch) -> None:
     monkeypatch.setattr(
         orchestrator_main, "check_advice_boundary", _allow_advice_boundary
     )
-    secret = "test-secret-key-with-at-least-32-bytes"
-    monkeypatch.setenv("JWT_SECRET", secret)
+    token = _sandbox_access_token(monkeypatch, "trusted-account")
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    token = jwt.encode(
-        {
-            "sub": "trusted-account",
-            "iat": int(time()),
-            "exp": time() + 300,
-            "iss": "banking-auth",
-            "aud": "banking-api",
-            "typ": "access",
-        },
-        secret,
-        algorithm="HS256",
-    )
     def fake_anonymize_message(content):
         return content.replace("555-0100", "<PHONE_NUMBER>")
 
@@ -593,7 +609,9 @@ def test_chat_sse_masks_message_and_streams_graph_events(monkeypatch) -> None:
     )
 
     async def fake_stream_agent_events(graph, state):
-        assert graph["token"] == token
+        context = validate_access_context(graph["token"])
+        assert context.subject == "trusted-account"
+        assert context.scopes == frozenset({"chat:respond"})
         assert state["account_id"] == "trusted-account"
         assert state["messages"][-1].content == "Call me at <PHONE_NUMBER>"
         yield {"type": "content", "content": "Your balance is available."}
@@ -689,7 +707,7 @@ def test_chat_balance_prompts_for_account_then_returns_selected_balance(monkeypa
     monkeypatch.setattr(
         orchestrator_main, "_classify_chat_intent", classify_balance
     )
-    token = "validated-test-token"
+    token = _sandbox_access_token(monkeypatch)
     monkeypatch.setenv("BALANCE_SERVICE_URL", "http://balance.test")
 
     async def passthrough_check(
@@ -712,7 +730,11 @@ def test_chat_balance_prompts_for_account_then_returns_selected_balance(monkeypa
             return False
 
         async def get(self, url, headers):
-            assert headers == {"Authorization": f"Bearer {token}"}
+            context = validate_access_context(
+                bearer_token(headers["Authorization"])
+            )
+            assert context.subject == "sandbox-checking-001"
+            assert context.scopes == frozenset({"account:read"})
             requested_urls.append(url)
             request = httpx.Request("GET", url)
             if url == "http://balance.test/sandbox/accounts":
@@ -845,7 +867,7 @@ def test_chat_balance_uses_only_account_without_prompt(monkeypatch) -> None:
         "_classify_chat_intent",
         _intent_classifier("balance_check"),
     )
-    token = "validated-test-token"
+    token = _sandbox_access_token(monkeypatch)
     monkeypatch.setenv("BALANCE_SERVICE_URL", "http://balance.test")
 
     async def passthrough_check(
@@ -964,7 +986,10 @@ def test_contextual_sufficiency_followup_checks_current_balance(monkeypatch) -> 
             return False
 
         async def get(self, url, headers):
-            assert headers == {"Authorization": "Bearer token"}
+            context = validate_access_context(
+                bearer_token(headers["Authorization"])
+            )
+            assert context.scopes == frozenset({"account:read"})
             requested_urls.append(url)
             request = httpx.Request("GET", url)
             if url == "http://balance.test/sandbox/accounts":
@@ -993,7 +1018,7 @@ def test_contextual_sufficiency_followup_checks_current_balance(monkeypatch) -> 
         return [
             event
             async for event in orchestrator_main._stream_response(
-                "token",
+                _sandbox_access_token(monkeypatch, "customer-001"),
                 "customer-001",
                 "Is this enough to transfer 500",
                 guardrails=FakeRails(),
@@ -1050,7 +1075,7 @@ def test_incomplete_transfer_request_prompts_for_accounts(monkeypatch) -> None:
         return [
             event
             async for event in orchestrator_main._stream_response(
-                "validated-test-token",
+                _sandbox_access_token(monkeypatch),
                 "sandbox-checking-001",
                 "Transfer 1USD",
             )
@@ -1071,7 +1096,14 @@ def test_incomplete_transfer_request_prompts_for_accounts(monkeypatch) -> None:
 
 
 def test_langgraph_runs_balance_tool_over_http(monkeypatch) -> None:
-    token = "validated-test-token"
+    monkeypatch.setenv("JWT_SECRET", "balance-routes-test-secret-at-least-32")
+    token = create_access_token(
+        "trusted-account",
+        scopes=("account:read",),
+        consent_state="not_required",
+        sca_state="not_required",
+        token_kind="delegated",
+    )
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setenv("BALANCE_SERVICE_URL", "http://balance.test")
 

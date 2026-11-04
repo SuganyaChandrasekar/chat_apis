@@ -70,12 +70,21 @@ from services.orchestrator.memory import (
 from services.orchestrator.pii import PiiMaskingUnavailable
 from services.api_errors import register_exception_handlers
 from services.authentication import (
+    AuthorizationDenied,
     InvalidAccessToken,
     JwtConfigurationError,
     bearer_token,
     create_access_token,
+    exchange_access_token,
+    validate_access_context,
     validate_access_token,
 )
+from services.authorization import (
+    HIGH_VALUE_TRANSFER_THRESHOLD,
+    record_authorization_decision,
+    transfer_action_id,
+)
+from services.security.audit import AuditStoreUnavailable
 from services.sandbox import (
     SANDBOX_CARD_OWNER_BY_ACCOUNT_ID,
     SANDBOX_CUSTOMER_ACCOUNTS,
@@ -415,6 +424,30 @@ async def forward_sandbox_transfer(
         raise HTTPException(status_code=403, detail="Account access is not authorized")
     if not transfer.confirmed:
         raise HTTPException(status_code=409, detail="Transfer confirmation is required")
+    action_id = transfer_action_id(
+        account_id=account_id,
+        source_account_id=transfer.source_account_id,
+        destination_account_id=transfer.destination_account_id,
+        amount=transfer.amount,
+        currency=transfer.currency,
+        idempotency_key=idempotency_key,
+    )
+    try:
+        token = exchange_access_token(
+            token,
+            scopes=("transfer:execute",),
+            consent_state="granted",
+            consent_action=action_id,
+            sca_state=(
+                "required"
+                if transfer.amount >= HIGH_VALUE_TRANSFER_THRESHOLD
+                else "not_required"
+            ),
+        )
+    except AuthorizationDenied:
+        raise HTTPException(
+            status_code=403, detail="Transfer permission is not granted"
+        ) from None
 
     transfer_url = os.getenv("TRANSFER_SERVICE_URL", "http://localhost:8002")
     try:
@@ -509,6 +542,27 @@ def _authenticated_account_id(
             headers={"WWW-Authenticate": "Bearer"},
         ) from None
     return token, account_id
+
+
+def _workflow_scope(intent: str) -> str:
+    return {
+        "balance_check": "account:read",
+        "balance_sufficiency": "account:read",
+        "balance_history": "account:read",
+        "account_number": "account:read",
+        "transaction_history": "transactions:read",
+        "transfer_history": "transfer:read",
+        "transfer_request": "transfer:prepare",
+        "fraud_report": "fraud:report",
+    }.get(intent, "chat:respond")
+
+
+def _workflow_scopes(intent: str) -> tuple[str, ...]:
+    if intent == "transfer_request":
+        return "account:read", "transfer:prepare"
+    if intent == "transaction_history":
+        return "account:read", "transactions:read"
+    return (_workflow_scope(intent),)
 
 
 def _prepare_message(
@@ -958,6 +1012,65 @@ async def _stream_response(
         yield {"type": "completion"}
         return
 
+    scope = _workflow_scope(intent.intent)
+    try:
+        token = exchange_access_token(
+            token,
+            scopes=_workflow_scopes(intent.intent),
+            consent_state="not_required",
+            sca_state="not_required",
+        )
+        workflow_context = validate_access_context(token)
+    except AuthorizationDenied:
+        logger.warning("PDP denied a workflow for a missing scope")
+        try:
+            await asyncio.to_thread(
+                record_authorization_decision,
+                subject=account_id,
+                request_path=request_path,
+                scope=scope,
+                decision="deny",
+                consent_state="not_granted",
+                sca_state="not_performed",
+                action=intent.intent,
+            )
+        except AuditStoreUnavailable:
+            yield {
+                "type": "error",
+                "content": "Security authorization is unavailable.",
+            }
+            yield {"type": "completion"}
+            return
+        yield {
+            "type": "error",
+            "content": "This request is not authorized for the current session.",
+        }
+        yield {"type": "completion"}
+        return
+    except (InvalidAccessToken, JwtConfigurationError):
+        yield {"type": "error", "content": "Message processing is unavailable."}
+        yield {"type": "completion"}
+        return
+
+    try:
+        await asyncio.to_thread(
+            record_authorization_decision,
+            subject=workflow_context.subject,
+            request_path=request_path,
+            scope=scope,
+            decision="allow",
+            consent_state=workflow_context.consent_state,
+            sca_state=workflow_context.sca_state,
+            action=intent.intent,
+        )
+    except AuditStoreUnavailable:
+        yield {
+            "type": "error",
+            "content": "Security authorization is unavailable.",
+        }
+        yield {"type": "completion"}
+        return
+
     guardrail_turn_context = [
         *guardrail_context,
         {"role": "user", "content": content},
@@ -1334,6 +1447,9 @@ async def _stream_response(
     state["transaction_date_hint"] = intent.date_hint
     state["transaction_merchant_hint"] = intent.merchant_hint
     state["fraud_card_hint"] = intent.card_hint
+    state["authorization_scope"] = scope
+    state["consent_state"] = workflow_context.consent_state
+    state["sca_state"] = workflow_context.sca_state
     logger.info("Chat message prepared")
     graph = build_agent_graph(token, account_id)
     logger.info("Chat agent graph built")

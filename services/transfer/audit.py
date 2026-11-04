@@ -29,6 +29,19 @@ class TransferAuditEvent(AuditBase):
             "status IN ('PENDING_VALIDATION', 'SUCCESS', 'FAILED')",
             name="ck_transfer_audit_status",
         ),
+        CheckConstraint(
+            "policy_decision IN ('ALLOW', 'DENY')",
+            name="ck_transfer_audit_policy_decision",
+        ),
+        CheckConstraint(
+            "consent_state IN ('GRANTED', 'NOT_REQUIRED', 'DENIED')",
+            name="ck_transfer_audit_consent_state",
+        ),
+        CheckConstraint(
+            "sca_state IN ('NOT_REQUIRED', 'REQUIRED', 'VERIFIED', 'FAILED', "
+            "'ABANDONED', 'UNAVAILABLE')",
+            name="ck_transfer_audit_sca_state",
+        ),
         UniqueConstraint(
             "account_id", "idempotency_key", "status", name="uq_transfer_audit_state"
         ),
@@ -43,6 +56,15 @@ class TransferAuditEvent(AuditBase):
     amount: Mapped[object] = mapped_column(Numeric(12, 2))
     currency: Mapped[str] = mapped_column(String(3))
     status: Mapped[str] = mapped_column(String(32))
+    policy_decision: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="ALLOW"
+    )
+    consent_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="GRANTED"
+    )
+    sca_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="NOT_REQUIRED"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -105,6 +127,8 @@ def begin_transfer(
     destination_account_id: str,
     amount,
     currency: str,
+    consent_state: str = "GRANTED",
+    sca_state: str = "NOT_REQUIRED",
 ) -> TransferStart:
     try:
         with Session(_engine()) as session:
@@ -133,6 +157,9 @@ def begin_transfer(
                     amount=amount,
                     currency=currency,
                     status="PENDING_VALIDATION",
+                    policy_decision="ALLOW",
+                    consent_state=consent_state,
+                    sca_state=sca_state,
                 )
             )
             session.commit()
@@ -155,6 +182,9 @@ def append_transfer_status(
     amount,
     currency: str,
     status: str,
+    consent_state: str = "GRANTED",
+    sca_state: str = "NOT_REQUIRED",
+    policy_decision: str = "ALLOW",
 ) -> None:
     try:
         with Session(_engine()) as session:
@@ -169,6 +199,9 @@ def append_transfer_status(
                     amount=amount,
                     currency=currency,
                     status=status,
+                    consent_state=consent_state,
+                    sca_state=sca_state,
+                    policy_decision=policy_decision,
                 )
             )
             session.commit()

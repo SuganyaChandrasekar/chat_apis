@@ -4,6 +4,7 @@ import pytest
 
 from langchain_core.messages import ToolMessage
 
+from services.authentication import create_access_token
 from services.orchestrator.agent import ChatState, stream_agent_events
 from services.orchestrator.cache import (
     DEFAULT_FAQ_CACHE_TTL_SECONDS,
@@ -88,6 +89,23 @@ def test_redis_cache_uses_default_ttl_when_configuration_is_missing(monkeypatch)
 
 
 def test_authenticated_balance_query_bypasses_faq_cache(monkeypatch) -> None:
+    monkeypatch.setenv("SANDBOX_MODE", "false")
+    monkeypatch.setenv("JWT_SECRET", "faq-cache-tests-secret-at-least-32")
+    monkeypatch.setattr(
+        orchestrator_main,
+        "exchange_access_token",
+        lambda _token, *, scopes, consent_state, sca_state: create_access_token(
+            "account-123",
+            scopes=scopes,
+            consent_state=consent_state,
+            sca_state=sca_state,
+            token_kind="delegated",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "record_authorization_decision", lambda **kwargs: None
+    )
+
     class FailingCache:
         ttl_seconds = 300
 

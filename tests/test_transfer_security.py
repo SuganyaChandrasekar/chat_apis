@@ -2,11 +2,18 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from services.authentication import (
+    bearer_token,
+    create_access_token,
+    validate_access_context,
+)
+from services.authorization import create_sca_attestation, transfer_action_id
 from services.sandbox import SANDBOX_INITIAL_BALANCES, SandboxTransferRequest
 from services.transfer import main as transfer_service
 from services.transfer import audit as transfer_audit
@@ -27,6 +34,22 @@ def _transfer(source_account_id: str, amount: str, otp_code: str | None = None):
     )
 
 
+@pytest.fixture(autouse=True)
+def transfer_authorization(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", "transfer-security-test-secret-32-bytes")
+    monkeypatch.setenv("SANDBOX_MODE", "true")
+    token = create_access_token(
+        "sandbox-checking-001",
+        scopes=("transfer:execute",),
+    )
+    monkeypatch.setattr(transfer_service, "bearer_token", lambda _header: token)
+
+
+def _authorization(monkeypatch) -> str:
+    monkeypatch.setenv("JWT_SECRET", "transfer-security-test-secret-32-bytes")
+    return f"Bearer {create_access_token('sandbox-checking-001', scopes=('transfer:execute',))}"
+
+
 def test_frozen_source_is_blocked_and_audited(monkeypatch) -> None:
     monkeypatch.setattr(transfer_service, "balances", SANDBOX_INITIAL_BALANCES.copy())
     monkeypatch.setattr(
@@ -43,7 +66,7 @@ def test_frozen_source_is_blocked_and_audited(monkeypatch) -> None:
     monkeypatch.setattr(
         transfer_service,
         "append_transfer_status",
-        lambda **kwargs: audit_statuses.append(kwargs["status"]),
+        lambda **kwargs: audit_statuses.append(kwargs),
     )
 
     with pytest.raises(HTTPException) as error:
@@ -58,7 +81,8 @@ def test_frozen_source_is_blocked_and_audited(monkeypatch) -> None:
 
     assert error.value.status_code == 409
     assert error.value.detail.startswith("ACCOUNT_FROZEN:")
-    assert audit_statuses == ["FAILED"]
+    assert audit_statuses[0]["status"] == "FAILED"
+    assert audit_statuses[0]["sca_state"] == "NOT_REQUIRED"
     assert transfer_service.balances["sandbox-savings-001"] == Decimal("3200.00")
 
 
@@ -73,7 +97,7 @@ def test_high_value_transfer_requires_otp_and_is_audited(monkeypatch) -> None:
     monkeypatch.setattr(
         transfer_service,
         "append_transfer_status",
-        lambda **kwargs: audit_statuses.append(kwargs["status"]),
+        lambda **kwargs: audit_statuses.append(kwargs),
     )
 
     with pytest.raises(HTTPException) as error:
@@ -87,8 +111,9 @@ def test_high_value_transfer_requires_otp_and_is_audited(monkeypatch) -> None:
         )
 
     assert error.value.status_code == 401
-    assert error.value.detail == "MFA verification is required"
-    assert audit_statuses == ["FAILED"]
+    assert "retry in your bank's secure verification flow or cancel" in error.value.detail
+    assert audit_statuses[0]["status"] == "FAILED"
+    assert audit_statuses[0]["sca_state"] == "ABANDONED"
     assert transfer_service.balances["sandbox-savings-001"] == Decimal("3200.00")
 
 
@@ -133,6 +158,85 @@ def test_insufficient_balance_is_rejected_before_mfa_verification(monkeypatch) -
     assert error.value.detail.startswith("INSUFFICIENT_FUNDS:")
     assert audit_statuses == ["FAILED"]
     assert transfer_service.balances == SANDBOX_INITIAL_BALANCES
+
+
+def test_high_value_transfer_executes_only_with_matching_sca_attestation(
+    monkeypatch,
+) -> None:
+    transfer_service.balances = SANDBOX_INITIAL_BALANCES.copy()
+    monkeypatch.setattr(
+        transfer_service,
+        "begin_transfer",
+        lambda **kwargs: TransferStart("sca-transaction", "PENDING_VALIDATION", False),
+    )
+    audit_events = []
+    monkeypatch.setattr(
+        transfer_service,
+        "append_transfer_status",
+        lambda **kwargs: audit_events.append(kwargs),
+    )
+
+    class VerifiedMfaClient:
+        def __init__(self, timeout):
+            assert timeout == 5.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exception_type, exception, traceback):
+            return False
+
+        async def post(self, url, headers, json):
+            assert url.endswith("/verify-otp")
+            context = validate_access_context(
+                bearer_token(headers["Authorization"])
+            )
+            assert context.subject == "sandbox-checking-001"
+            assert context.consent_state == "granted"
+            assert context.sca_state == "required"
+            action_id = transfer_action_id(
+                account_id=json["account_id"],
+                source_account_id=json["source_account_id"],
+                destination_account_id=json["destination_account_id"],
+                amount=Decimal(json["transaction_amount"]),
+                currency=json["currency"],
+                idempotency_key=json["idempotency_key"],
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "status": "verified",
+                    "sca_token": create_sca_attestation(
+                        subject=context.subject,
+                        action_id=action_id,
+                        transaction_id=json["transaction_id"],
+                        amount=Decimal(json["transaction_amount"]),
+                        currency=json["currency"],
+                    ),
+                },
+            )
+
+    monkeypatch.setattr(transfer_service.httpx, "AsyncClient", VerifiedMfaClient)
+    result = asyncio.run(
+        transfer_service.create_sandbox_transfer(
+            SandboxTransferRequest(
+                source_account_id="sandbox-checking-001",
+                destination_account_id="sandbox-savings-001",
+                amount="1000.00",
+                confirmed=True,
+                otp_code="123456",
+            ),
+            "sca-success-key",
+            _authorization(monkeypatch),
+            "sandbox-checking-001",
+        )
+    )
+
+    assert result.status == "SUCCESS"
+    assert audit_events[-1]["status"] == "SUCCESS"
+    assert audit_events[-1]["consent_state"] == "GRANTED"
+    assert audit_events[-1]["sca_state"] == "VERIFIED"
+    assert transfer_service.balances["sandbox-checking-001"] == Decimal("500.00")
 
 
 def test_latest_transfer_returns_account_ids_for_authenticated_customer(monkeypatch):

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from services.authentication import create_access_token
+from services.authorization import create_sca_attestation
 from services.cards import store as cards_store
 from services.cards import main as cards_main
 from services.cards.store import Card, CardBase
@@ -87,7 +88,7 @@ def test_card_freeze_requires_mfa_before_status_change(monkeypatch) -> None:
     )
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "MFA verification is required"
+    assert "retry verification or cancel" in response.json()["detail"]
     assert _card_status("card_debit_4321") == "active"
 
 
@@ -135,7 +136,7 @@ def test_card_freeze_rejects_unverified_otp(monkeypatch) -> None:
     )
 
     assert response.status_code == 401
-    assert response.json()["detail"] == "MFA verification failed"
+    assert "retry verification or cancel" in response.json()["detail"]
     assert _card_status("card_debit_4321") == "active"
 
 
@@ -156,16 +157,23 @@ def test_card_freeze_verifies_otp_persists_status_and_returns_confirmation(
 
         async def post(self, url, headers, json):
             assert url == "http://localhost:8003/verify-otp"
-            assert headers == _authorization()
-            assert json == {
-                "account_id": "usr_sandbox_01",
-                "otp_code": "123456",
-                "purpose": "card_freeze",
-            }
+            assert headers["Authorization"].startswith("Bearer ")
+            assert json["account_id"] == "usr_sandbox_01"
+            assert json["otp_code"] == "123456"
+            assert json["purpose"] == "card_freeze"
+            assert json["transaction_id"] == "card_debit_4321"
             return httpx.Response(
                 200,
                 request=httpx.Request("POST", url),
-                json={"status": "verified"},
+                json={
+                    "status": "verified",
+                    "sca_token": create_sca_attestation(
+                        subject=json["account_id"],
+                        action_id=json["action_id"],
+                        transaction_id=json["transaction_id"],
+                        purpose="card_freeze",
+                    ),
+                },
             )
 
     monkeypatch.setattr(cards_main.httpx, "AsyncClient", FakeMfaClient)
