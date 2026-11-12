@@ -79,6 +79,8 @@ class RecentTransactionsPayload(BaseModel):
 
 class ChatState(MessagesState):
     account_id: str
+    correlation_id: str
+    conversation_id: str
     tool_states: dict[str, str]
     intent: str
     distress_tier: int
@@ -90,6 +92,25 @@ class ChatState(MessagesState):
     authorization_scope: str
     consent_state: str
     sca_state: str
+
+
+async def _trace_node(
+    state: ChatState, event_type: str, payload: dict
+) -> None:
+    correlation_id = state.get("correlation_id")
+    conversation_id = state.get("conversation_id")
+    if not correlation_id or not conversation_id:
+        return
+    from services.orchestrator.memory import record_decision_trace
+
+    await asyncio.to_thread(
+        record_decision_trace,
+        conversation_id=conversation_id,
+        correlation_id=correlation_id,
+        event_type=event_type,
+        payload=payload,
+        source="langgraph",
+    )
 
 
 def append_conversation_message(state: ChatState, message: BaseMessage) -> None:
@@ -428,6 +449,14 @@ def build_agent_graph(access_token: str, account_id: str):
             answer = chunk if answer is None else answer + chunk
         if answer is None:
             raise RuntimeError("Chat model returned no response")
+        await _trace_node(
+            state,
+            "model_response",
+            {
+                "model": model_name,
+                "content": answer.content if isinstance(answer.content, str) else "",
+            },
+        )
         logger.info("Gemini response received")
         return {"messages": [answer]}
 
@@ -503,6 +532,11 @@ def build_agent_graph(access_token: str, account_id: str):
             reason=str(latest_message.content),
             card_hint=state.get("fraud_card_hint"),
         )
+        await _trace_node(
+            state,
+            "workflow_node",
+            {"node": "risk_distress", "outcome": "completed"},
+        )
         return {"messages": [AIMessage(content=answer)]}
 
     async def run_tools(state: ChatState) -> dict:
@@ -513,6 +547,11 @@ def build_agent_graph(access_token: str, account_id: str):
             call_id = call["id"]
             states[call_id] = "running"
             registered_tool = tools_by_name.get(call["name"])
+            await _trace_node(
+                state,
+                "tool_invoked",
+                {"tool": call["name"], "tool_call_id": call_id},
+            )
             if registered_tool is None:
                 logger.warning("Requested unknown agent tool")
                 result = "Requested service is unavailable."
@@ -562,6 +601,16 @@ def build_agent_graph(access_token: str, account_id: str):
                         )
                     result = await registered_tool.ainvoke(tool_args)
                     states[call_id] = "completed"
+                    await _trace_node(
+                        state,
+                        "tool_result",
+                        {
+                            "tool": call["name"],
+                            "tool_call_id": call_id,
+                            "status": "completed",
+                            "result": str(result),
+                        },
+                    )
                     logger.info("Agent tool %s completed", call["name"])
                 except (AuthorizationDenied, InvalidAccessToken):
                     await asyncio.to_thread(
@@ -580,12 +629,28 @@ def build_agent_graph(access_token: str, account_id: str):
                     )
                     result = "This action is not authorized for the current session."
                     states[call_id] = "failed"
+                    await _trace_node(
+                        state,
+                        "tool_result",
+                        {
+                            "tool": call["name"],
+                            "tool_call_id": call_id,
+                            "status": "denied",
+                        },
+                    )
                 except Exception:
                     result = "Requested service is unavailable."
                     states[call_id] = "failed"
-                    logger.warning(
-                        "Agent tool %s failed", call["name"], exc_info=True
+                    await _trace_node(
+                        state,
+                        "tool_result",
+                        {
+                            "tool": call["name"],
+                            "tool_call_id": call_id,
+                            "status": "failed",
+                        },
                     )
+                    logger.warning("Agent tool %s failed", call["name"])
             tool_messages.append(
                 ToolMessage(
                     content=str(result),
@@ -595,12 +660,20 @@ def build_agent_graph(access_token: str, account_id: str):
             )
         return {"messages": tool_messages, "tool_states": states}
 
-    def route_after_agent(state: ChatState) -> str:
+    async def route_after_agent(state: ChatState) -> str:
         latest_message = state["messages"][-1]
-        return "tools" if getattr(latest_message, "tool_calls", []) else END
+        route = "tools" if getattr(latest_message, "tool_calls", []) else END
+        await _trace_node(state, "routing_decision", {"route": route})
+        return route
 
-    def route_entry(state: ChatState) -> str:
-        return "risk_distress" if state.get("intent") == "fraud_report" else "agent"
+    async def route_entry(state: ChatState) -> str:
+        route = "risk_distress" if state.get("intent") == "fraud_report" else "agent"
+        await _trace_node(
+            state,
+            "routing_decision",
+            {"route": route, "intent": state.get("intent")},
+        )
+        return route
 
     workflow = StateGraph(ChatState)
     workflow.add_node("agent", call_model)

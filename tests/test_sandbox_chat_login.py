@@ -91,6 +91,10 @@ def test_sandbox_test_login_rejects_unconfigured_browser_origin(monkeypatch) -> 
 
 
 def test_websocket_accepts_local_sandbox_cookie(monkeypatch) -> None:
+    async def skip_trace(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(orchestrator_main, "_trace_decision", skip_trace)
     monkeypatch.setenv("SANDBOX_MODE", "true")
     monkeypatch.setenv("LOCAL_TEST_AUTH_ENABLED", "true")
     monkeypatch.setenv("JWT_SECRET", "test-secret-key-with-at-least-32-bytes")
@@ -153,20 +157,31 @@ def test_websocket_accepts_local_sandbox_cookie(monkeypatch) -> None:
     with client.websocket_connect(
         "/chat", headers={"origin": "http://localhost:5173"}
     ) as websocket:
+        websocket.send_json({"type": "invalid", "content": "bad payload"})
+        invalid = websocket.receive_json()
+        assert invalid["type"] == "error"
+        assert invalid["correlation_id"]
         websocket.send_json(
             {"type": "message", "content": "What is my balance?"}
         )
-        assert websocket.receive_json() == {
-            "type": "content",
-            "content": "Your test ",
-        }
-        assert websocket.receive_json() == {
-            "type": "content",
-            "content": "balance is available.",
-        }
+        first = websocket.receive_json()
+        assert first["type"] == "content"
+        assert first["content"] == "Your test "
+        assert first["correlation_id"]
+        assert first["correlation_id"] != invalid["correlation_id"]
+        assert first["conversation_id"]
+        correlation_id = first["correlation_id"]
+        conversation_id = first["conversation_id"]
+        second = websocket.receive_json()
+        assert second["type"] == "content"
+        assert second["content"] == "balance is available."
+        assert second["correlation_id"] == correlation_id
+        assert second["conversation_id"] == conversation_id
         completion = websocket.receive_json()
         assert completion["type"] == "completion"
         thread_id = completion["thread_id"]
+        assert completion["correlation_id"] == correlation_id
+        assert completion["conversation_id"] == thread_id
         websocket.send_json(
             {"type": "message", "content": "What was the earlier question?"}
         )

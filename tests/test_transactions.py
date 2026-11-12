@@ -187,6 +187,7 @@ def test_transaction_history_intent_extracts_entities() -> None:
             assert "merchant_hint" in prompt
             return (
                 '{"intent":"transaction_history","limit":5,'
+                '"confidence":0.91,'
                 '"account_hint":"checking","date_hint":"this month",'
                 '"merchant_hint":"coffee"}'
             )

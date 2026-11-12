@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Any, Awaitable, Callable
 
@@ -11,6 +12,8 @@ from services.security.audit import (
     AuditStoreUnavailable,
     record_application_error,
     record_security_event,
+    reset_audit_context,
+    set_audit_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,54 +52,61 @@ class ApiErrorResponse:
 
 def _request_id(request: Request) -> str:
     request_id = request.headers.get("x-request-id", "").strip()
-    if not request_id:
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
         request_id = str(uuid.uuid4())
     request.state.request_id = request_id
+    request.state.correlation_id = str(uuid.uuid4())
     return request_id
 
 
 async def request_id_middleware(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    """Populate a request ID and convert route failures into stable responses."""
+    """Assign request identifiers and convert route failures into stable responses."""
 
     request_id = _request_id(request)
+    correlation_id = request.state.correlation_id
+    audit_context = set_audit_context(correlation_id, None)
     try:
-        response = await call_next(request)
-    except HTTPException as exception:
-        response = _http_exception_response(request, exception)
-    except ApplicationError as exception:
-        response = _exception_response(
-            request,
-            exception,
-            code=exception.code,
-            message=str(exception),
-            status_code=exception.status_code,
-            event_type="APPLICATION_ERROR",
-            severity="ERROR",
-        )
-    except SecurityError as exception:
-        response = _exception_response(
-            request,
-            exception,
-            code=exception.code,
-            message=str(exception),
-            status_code=exception.status_code,
-            event_type="SECURITY",
-            severity="ERROR",
-        )
-    except Exception as exception:
-        response = _exception_response(
-            request,
-            exception,
-            code="INTERNAL_SERVER_ERROR",
-            message="An internal error occurred",
-            status_code=500,
-            event_type="APPLICATION_ERROR",
-            severity="CRITICAL",
-        )
-    response.headers["x-request-id"] = request_id
-    return response
+        try:
+            response = await call_next(request)
+        except HTTPException as exception:
+            response = _http_exception_response(request, exception)
+        except ApplicationError as exception:
+            response = _exception_response(
+                request,
+                exception,
+                code=exception.code,
+                message=str(exception),
+                status_code=exception.status_code,
+                event_type="APPLICATION_ERROR",
+                severity="ERROR",
+            )
+        except SecurityError as exception:
+            response = _exception_response(
+                request,
+                exception,
+                code=exception.code,
+                message=str(exception),
+                status_code=exception.status_code,
+                event_type="SECURITY",
+                severity="ERROR",
+            )
+        except Exception as exception:
+            response = _exception_response(
+                request,
+                exception,
+                code="INTERNAL_SERVER_ERROR",
+                message="An internal error occurred",
+                status_code=500,
+                event_type="APPLICATION_ERROR",
+                severity="CRITICAL",
+            )
+        response.headers["x-request-id"] = request_id
+        response.headers["x-correlation-id"] = correlation_id
+        return response
+    finally:
+        reset_audit_context(audit_context)
 
 
 def _safe_request_details(request: Request) -> dict[str, Any]:

@@ -244,6 +244,15 @@ async def check_advice_boundary(
             source="fca_advice_boundary",
             reason="LLM classified request as seeking regulated personal investment advice.",
         )
+    else:
+        _record_check(
+            direction="advice_boundary",
+            status="PASSED",
+            rail="fca_advice_boundary",
+            user_id=user_id,
+            request_path=request_path,
+            source="fca_advice_boundary",
+        )
     return {
         "is_blocked": blocked,
         "reason": reason,

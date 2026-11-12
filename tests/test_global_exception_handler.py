@@ -105,3 +105,24 @@ def test_audit_failure_does_not_replace_client_response(monkeypatch) -> None:
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "INTERNAL_SERVER_ERROR"
+
+
+def test_correlation_id_is_unique_even_when_request_id_is_reused() -> None:
+    app = FastAPI()
+    register_exception_handlers(app)
+
+    @app.get("/ids")
+    async def identifiers(request: Request) -> dict[str, str]:
+        return {
+            "request_id": request.state.request_id,
+            "correlation_id": request.state.correlation_id,
+        }
+
+    client = TestClient(app)
+    first = client.get("/ids", headers={"x-request-id": "client-request"})
+    second = client.get("/ids", headers={"x-request-id": "client-request"})
+
+    assert first.json()["request_id"] == second.json()["request_id"]
+    assert first.json()["correlation_id"] != second.json()["correlation_id"]
+    assert first.headers["x-correlation-id"] == first.json()["correlation_id"]
+    assert second.headers["x-correlation-id"] == second.json()["correlation_id"]

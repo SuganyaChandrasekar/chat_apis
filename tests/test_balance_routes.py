@@ -59,7 +59,9 @@ def classify_other_intents_by_default(monkeypatch):
         orchestrator_agent, "record_authorization_decision", lambda **kwargs: None
     )
     async def classify_intent(rails, content, context):
-        return orchestrator_main.ChatIntentClassification(intent="other")
+        return orchestrator_main.ChatIntentClassification(
+            intent="other", confidence=0.9
+        )
 
     monkeypatch.setattr(
         orchestrator_main, "_classify_chat_intent", classify_intent
@@ -70,6 +72,7 @@ def _intent_classifier(intent, **entities):
     async def classify_intent(rails, content, context):
         return orchestrator_main.ChatIntentClassification(
             intent=intent,
+            confidence=0.9,
             **entities,
         )
 
@@ -578,6 +581,10 @@ def test_app_lifespan_initializes_guardrails_before_requests(monkeypatch) -> Non
 
 
 def test_chat_sse_masks_message_and_streams_graph_events(monkeypatch) -> None:
+    async def skip_trace(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(orchestrator_main, "_trace_decision", skip_trace)
     monkeypatch.setattr(
         orchestrator_main, "check_advice_boundary", _allow_advice_boundary
     )
@@ -701,6 +708,7 @@ def test_chat_balance_prompts_for_account_then_returns_selected_balance(monkeypa
         hint = "Savings" if "saving" in content.casefold() else None
         return orchestrator_main.ChatIntentClassification(
             intent="balance_check",
+            confidence=0.9,
             account_hint=hint,
         )
 

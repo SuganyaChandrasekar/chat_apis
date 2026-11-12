@@ -46,7 +46,7 @@ def test_public_faq_intent_is_classified_semantically() -> None:
         async def generate_async(self, prompt, options):
             assert "public_faq" in prompt
             assert "general informational questions about banking concepts" in prompt
-            return '{"intent":"public_faq"}'
+            return '{"intent":"public_faq","confidence":0.93}'
 
     classification = asyncio.run(
         orchestrator_main._classify_chat_intent(
@@ -127,7 +127,9 @@ def test_authenticated_balance_query_bypasses_faq_cache(monkeypatch) -> None:
             orchestrator_main, "check_advice_boundary", _allow_advice_boundary
         )
         async def classify_intent(rails, content, context):
-            return orchestrator_main.ChatIntentClassification(intent="other")
+            return orchestrator_main.ChatIntentClassification(
+                intent="other", confidence=0.9
+            )
 
         monkeypatch.setattr(
             orchestrator_main, "_classify_chat_intent", classify_intent

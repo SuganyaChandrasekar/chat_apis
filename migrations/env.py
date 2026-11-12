@@ -6,6 +6,7 @@ from sqlalchemy import engine_from_config, pool
 
 from services.cards.store import CardBase
 from services.fraud.store import FraudBase
+from services.security.audit import DecisionTraceEvent, SecurityAuditEvent
 from services.transfer.audit import AuditBase
 
 

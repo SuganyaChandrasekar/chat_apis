@@ -11,7 +11,7 @@ def test_chat_classifier_detects_scam_reports_semantically() -> None:
         async def generate_async(self, *, prompt, options):
             assert "suspected scam" in prompt
             assert "'my card'" in prompt
-            return '{"intent":"fraud_report","card_hint":"debit"}'
+            return '{"intent":"fraud_report","confidence":0.95,"card_hint":"debit"}'
 
     result = asyncio.run(
         main._classify_chat_intent(

@@ -80,9 +80,11 @@ Then run the UI from `C:\chatbot\bank-chatbot_ui` with `npm run dev` and open `h
 
 ## Current scope and required integrations
 
-The orchestrator chat API uses HS256 JWTs signed with `JWT_SECRET` (minimum 32 bytes), with issuer `banking-auth`, audience `banking-api`, and the authorized account ID in `sub`. Configure `GEMINI_API_KEY` and optionally `GEMINI_MODEL` (defaults to `gemini-3.5-flash-lite`) to enable chat. NeMo Guardrails runs Presidio input/output masking and a history-aware LLM self-check for retail banking scope, credential safety, and prompt injection before user content is passed to LangGraph. The orchestrator uses a structured LLM classification of each masked message and recent turns to route balance checks, transaction history, transfer questions, account-number requests, scam/fraud reports, and public FAQs, as well as extract relevant entities. Scam reports take a deterministic risk/distress graph path; public FAQ caching does not apply. Classified account names are matched only against accounts returned for the authenticated customer. These checks fail closed if NeMo, Presidio, a model check, or audit persistence is unavailable. Guardrail decisions are written to `security_audit_events` without storing prompt or response text. Configure `DATABASE_URL` and run `alembic upgrade head` before enabling chat; startup initializes the LangGraph PostgreSQL checkpoint tables. `POST /chat/stream` streams SSE; `/chat` accepts authenticated WebSocket messages and emits content and completion events.
+The orchestrator chat API uses HS256 JWTs signed with `JWT_SECRET` (minimum 32 bytes), with issuer `banking-auth`, audience `banking-api`, and the authorized account ID in `sub`. Configure `GEMINI_API_KEY` and optionally `GEMINI_MODEL` (defaults to `gemini-3.5-flash-lite`) to enable chat. NeMo Guardrails runs Presidio input/output masking and a history-aware LLM self-check for retail banking scope, credential safety, and prompt injection before user content is passed to LangGraph. The orchestrator uses a structured LLM classification of each masked message and recent turns to route balance checks, transaction history, transfer questions, account-number requests, scam/fraud reports, and public FAQs, as well as extract relevant entities. Scam reports take a deterministic risk/distress graph path; public FAQ caching does not apply. Classified account names are matched only against accounts returned for the authenticated customer. These checks fail closed if NeMo, Presidio, a model check, or audit persistence is unavailable. Guardrail decisions are written to `security_audit_events` without storing prompt or response text. Sanitized decision events in `decision_trace_events` link user input, NLU classification/confidence, policy and routing decisions, graph/tool activity, source markers, and final responses by conversation and correlation ID. Security and decision-trace events are append-only in PostgreSQL; free text is Presidio-scanned before persistence and financial amounts/account identifiers in trace content are scrubbed. Chat checkpoints retain their separate 20-message/15-minute expiration policy and are not the immutable compliance trace. Configure `DATABASE_URL` and run `alembic upgrade head` before enabling chat; startup initializes the LangGraph PostgreSQL checkpoint tables. `POST /chat/stream` streams SSE; `/chat` accepts authenticated WebSocket messages and emits content and completion events.
 
 Chat messages may include an optional UUID `thread_id`. If omitted, the orchestrator creates an owner-bound conversation and returns its ID in the completion event. Send that ID on later HTTP requests or after reconnecting a WebSocket to restore that conversation. The orchestrator verifies ownership against the authenticated JWT subject before reading history. Checkpoints retain at most 20 anonymized human/assistant text messages; raw tool results, credentials, and unapproved metadata are excluded. Only validated distress score/tier and human-support-request flags are retained so an accepted sandbox hand-off does not need to re-run the classifier. A recent displayed balance is retained as a text summary so the chatbot can answer follow-up questions during the active session. After 15 minutes without activity, a background sweep expires the session and removes stored currency amounts and explicit account identifiers from its checkpoint history while retaining prior turns and non-sensitive account entities. The sweep runs every 30 seconds; returning to an expired thread starts a new active session with the scrubbed history. Choose and document an application retention/deletion policy before relying on the checkpoint store for production conversations.
+
+The orchestrator exports Prometheus metrics at `/metrics`; restrict network access to this endpoint to the monitoring system. All chat metric series carry `workflow` and `capability` labels. The intent accuracy metric is an authorization/tool-outcome proxy, not a labeled accuracy measure. Containment counts completed turns as resolved and hand-off/error turns as escalated. Grounding faithfulness is reported as `not_applicable` until a retrieval/grounding validation pipeline exists. Intent confidence is the classifier's model-reported score.
 
 EP7 distress scoring and warm hand-off are sandbox-only. Each masked user turn is assessed by a structured NeMo/LLM classifier against recent conversation context; it returns a normalized score, semantic risk level, and whether the user directly requests human support rather than matching crisis phrases. Scores map to tiers at 0.4, 0.7, 0.85, and 0.95; an explicit request for a human specialist also triggers the consent offer without inflating the distress score. If classification is unavailable or malformed, the sandbox chat turn fails closed. Tier 1/2 system prompts request empathetic, simple, unhurried language; Tier 2 adds an explicit consent offer, and accepting creates one hand-off package per authenticated session. Acceptance authorizes storing the masked identity and recent transcript. `POST /hand-off/package` takes `{ "session_id": "<owner-bound chat thread UUID>" }` and only succeeds while a hand-off consent offer is pending. Package writes use PostgreSQL after the migration or an in-memory mock store when no `DATABASE_URL` is configured. The endpoint reports `delivery.status: "not_configured"`: there is no specialist desk integration, notification, assignment, or real queue. The chat session remains available, but no specialist queue position is created or retained. Tier 3/4 replies signpost crisis help using `SANDBOX_CRISIS_CONTACT_TEXT`, defaulting to the sandbox contact text in the orchestrator. Never use the sandbox contact details or database entry as production support infrastructure.
 
@@ -111,3 +113,51 @@ $env:REDIS_URL = "redis://localhost:6379/0"
 $env:FAQ_CACHE_TTL_SECONDS = "300"
 $env:FAQ_CACHE_PREFIX = "bank-chatbot:faq"
 ```
+
+## Live Grafana dashboard
+
+### Windows without Docker
+
+Install Grafana using the Windows installer from [grafana.com/grafana/download](https://grafana.com/grafana/download). Install Prometheus by downloading its Windows ZIP from [prometheus.io/download](https://prometheus.io/download/) and extracting it, for example, to `C:\prometheus`.
+
+In PowerShell from the repository root, start the orchestrator and Prometheus in separate terminals:
+
+```powershell
+python -m uvicorn services.orchestrator.main:app --reload --port 8000
+```
+
+In the Prometheus terminal, run its executable from the extracted folder, pointing it at the repo's Windows-specific scrape configuration:
+
+```powershell
+cd C:\prometheus
+.\prometheus.exe --config.file=C:\chatbot\chat_apis\monitoring\prometheus-windows.yml
+```
+
+Configure Grafana to load the repository's Prometheus data source and dashboard. Run the following in an elevated PowerShell terminal after installing Grafana:
+
+```powershell
+$provisioning = Join-Path $env:ProgramFiles "GrafanaLabs\grafana\conf\provisioning"
+New-Item -ItemType Directory -Force `
+  (Join-Path $provisioning "datasources"), `
+  (Join-Path $provisioning "dashboards")
+Copy-Item .\monitoring\grafana\provisioning\windows\datasources\prometheus.yml `
+  (Join-Path $provisioning "datasources\chatbot-prometheus.yml")
+Copy-Item .\monitoring\grafana\provisioning\windows\dashboards\chatbot.yml `
+  (Join-Path $provisioning "dashboards\chatbot.yml")
+Restart-Service Grafana
+```
+
+The dashboard provider above points to `C:\chatbot\chat_apis`; change that path in `monitoring\grafana\provisioning\windows\dashboards\chatbot.yml` if the repository is located elsewhere, then copy it again and restart Grafana. Open [http://localhost:3000](http://localhost:3000) and sign in with `admin` / `admin` on first launch; Grafana will prompt you to choose a new password. Select **Chatbot → Chatbot Observability**. Check [http://localhost:9090/targets](http://localhost:9090/targets) if there is no data; `chatbot-orchestrator` should show `UP`. Graphs populate after chat turns have run and refresh every 5 seconds.
+
+The `/metrics` endpoint is unauthenticated, so keep the orchestrator bound to localhost as shown; do not expose it publicly.
+
+### Optional Docker setup
+
+Alternatively, install Docker Desktop and run the monitoring stack from the repository root:
+
+```powershell
+$env:GRAFANA_ADMIN_PASSWORD = "choose-a-strong-local-password"
+docker compose up -d
+```
+
+For this option, start the orchestrator on `0.0.0.0:8000` so the Prometheus container can scrape it. Keep port 8000 restricted to a trusted local network; do not expose the unauthenticated metrics endpoint publicly. Grafana is at [http://localhost:3000](http://localhost:3000), and `docker compose down` stops the monitoring containers.

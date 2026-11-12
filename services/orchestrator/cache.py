@@ -99,8 +99,10 @@ def create_faq_cache() -> FAQCache:
             prefix=os.getenv("FAQ_CACHE_PREFIX", DEFAULT_FAQ_CACHE_PREFIX),
             ttl_seconds=_cache_ttl_seconds(),
         )
-    except Exception:
-        logger.error("Unable to configure the FAQ cache", exc_info=True)
+    except Exception as error:
+        logger.error(
+            "Unable to configure the FAQ cache (%s)", type(error).__name__
+        )
         return NoOpFAQCache()
 
 
@@ -109,6 +111,6 @@ async def ping_faq_cache(cache: FAQCache) -> bool:
         return True
     try:
         return bool(await cache._client.ping())
-    except Exception:
-        logger.error("Unable to connect to the FAQ cache", exc_info=True)
+    except Exception as error:
+        logger.error("Unable to connect to the FAQ cache (%s)", type(error).__name__)
         return False

@@ -33,7 +33,9 @@ def allow_other_chat_intents_by_default(monkeypatch):
     )
 
     async def classify_intent(rails, content, context):
-        return orchestrator_main.ChatIntentClassification(intent="other")
+        return orchestrator_main.ChatIntentClassification(
+            intent="other", confidence=0.9
+        )
 
     monkeypatch.setattr(
         orchestrator_main, "_classify_chat_intent", classify_intent
@@ -44,6 +46,7 @@ def _intent_classifier(intent, **entities):
     async def classify_intent(rails, content, context):
         return orchestrator_main.ChatIntentClassification(
             intent=intent,
+            confidence=0.9,
             **entities,
         )
 
@@ -415,7 +418,9 @@ def test_affirmative_after_balance_offer_opens_balance_account_options(monkeypat
         assert context[-1]["content"] == (
             "Would you like to check the balance of one of these accounts?"
         )
-        return orchestrator_main.ChatIntentClassification(intent="balance_check")
+        return orchestrator_main.ChatIntentClassification(
+            intent="balance_check", confidence=0.9
+        )
 
     monkeypatch.setattr(
         orchestrator_main, "_classify_chat_intent", classify_balance_confirmation
@@ -1201,7 +1206,8 @@ def test_advice_boundary_blocks_and_audits_without_query_text(monkeypatch, query
     assert "Latest user query" in rails.advice_prompts[0]
 
 
-def test_advice_boundary_checks_conversation_context():
+def test_advice_boundary_checks_conversation_context(monkeypatch):
+    monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
     rails = FakeRails([])
     rails.advice_evaluations = iter(
         [
@@ -1340,7 +1346,8 @@ def test_chat_intent_classifier_extracts_contextual_entities():
         async def generate_async(self, prompt, options):
             self.prompts.append(prompt)
             return (
-                '```json\n{"intent":"balance_sufficiency","amount":"500.00",'
+                '```json\n{"intent":"balance_sufficiency","confidence":0.9,'
+                '"amount":"500.00",'
                 '"account_hint":"Savings"}\n```'
             )
 
@@ -1367,7 +1374,10 @@ def test_chat_intent_classifier_extracts_contextual_entities():
 def test_chat_intent_classifier_fails_closed_on_invalid_output():
     class IntentRails:
         async def generate_async(self, prompt, options):
-            return '{"intent":"balance_check","amount":"not-an-amount"}'
+            return (
+                '{"intent":"balance_check","confidence":0.8,'
+                '"amount":"not-an-amount"}'
+            )
 
     with pytest.raises(guardrails.GuardrailsUnavailable):
         asyncio.run(

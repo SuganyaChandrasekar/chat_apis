@@ -12,6 +12,7 @@ from langgraph.graph import END, MessagesState, StateGraph
 from psycopg_pool import AsyncConnectionPool
 
 from services.orchestrator.pii import anonymize_message
+from services.security.audit import append_decision_trace_event
 
 MAX_PERSISTED_MESSAGES = 20
 SESSION_INACTIVITY_MINUTES = 15
@@ -25,6 +26,11 @@ _SECRET_VALUE_PATTERN = re.compile(
 _STRUCTURED_SECRET_VALUE_PATTERN = re.compile(
     r'("(?:password|passcode|pin|otp|access_token|refresh_token|bearer_token|'
     r'authorization)"\s*:\s*")[^"]*(")',
+    re.IGNORECASE,
+)
+_SENSITIVE_TRACE_FIELD_PATTERN = re.compile(
+    r"(?:password|passwd|secret|token|authorization|credential|otp|pin|cvv|cvc|"
+    r"security[_ -]?code|ssn|pan|account[_ -]?(?:number|no|id))",
     re.IGNORECASE,
 )
 _BEARER_VALUE_PATTERN = re.compile(
@@ -148,6 +154,40 @@ def _expired_content(content: str) -> str:
         r"\1[EXPIRED]\2", content
     )
     return content
+
+
+def _redact_trace_values(value):
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]"
+            if _SENSITIVE_TRACE_FIELD_PATTERN.search(str(key))
+            else _redact_trace_values(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_trace_values(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_trace_values(item) for item in value]
+    if isinstance(value, str):
+        return _expired_content(value)
+    return value
+
+
+def record_decision_trace(
+    *,
+    conversation_id: str,
+    correlation_id: str,
+    event_type: str,
+    payload: dict,
+    source: str = "chat_orchestrator",
+) -> None:
+    append_decision_trace_event(
+        conversation_id=conversation_id,
+        correlation_id=correlation_id,
+        event_type=event_type,
+        payload=_redact_trace_values(payload),
+        source=source,
+    )
 
 
 def _expired_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
