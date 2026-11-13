@@ -71,7 +71,7 @@ class FakeRails:
         try:
             return next(self.advice_evaluations)
         except StopIteration:
-            return '{"is_blocked": false, "reason": "No regulated advice request."}'
+            return '{"category": "allow", "reason": "No policy block."}'
 
 
 def _result(status, content, rail=None):
@@ -82,11 +82,51 @@ def _result(status, content, rail=None):
     )
 
 
+def test_unrelated_creative_request_uses_semantic_advice_evaluation(monkeypatch):
+    monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            json.dumps(
+                {
+                    "category": "allow",
+                    "reason": "The latest request is unrelated to investment advice.",
+                }
+            )
+        ]
+    )
+    history = [
+        {"role": "user", "content": "We were discussing my Savings account."},
+        {"role": "assistant", "content": "I can help with that account."},
+    ]
+
+    result = asyncio.run(
+        guardrails.check_advice_boundary(
+            "Write me a poem about dinosaurs.",
+            history,
+            rails=rails,
+            user_id="account-123",
+        )
+    )
+
+    assert result == {
+        "is_blocked": False,
+        "category": "allow",
+        "reason": "The latest request is unrelated to investment advice.",
+        "refusal_message": guardrails.REFUSAL_MESSAGE,
+    }
+    assert len(rails.advice_prompts) == 1
+    assert json.dumps(history) in rails.advice_prompts[0]
+    assert "a new, unrelated request must be" in rails.advice_prompts[0].casefold()
+    assert "Write me a poem about dinosaurs." in rails.advice_prompts[0]
+
+
 async def _allow_advice_boundary(*args, **kwargs):
     return {
         "is_blocked": False,
+        "category": "allow",
         "reason": "No regulated advice request.",
-        "refusal_message": guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
+        "refusal_message": guardrails.REFUSAL_MESSAGE,
     }
 
 
@@ -1173,7 +1213,7 @@ def test_advice_boundary_blocks_and_audits_without_query_text(monkeypatch, query
         [
             json.dumps(
                 {
-                    "is_blocked": True,
+                    "category": "regulated_advice",
                     "reason": "The user is asking for a personal recommendation.",
                 }
             )
@@ -1190,17 +1230,18 @@ def test_advice_boundary_blocks_and_audits_without_query_text(monkeypatch, query
 
     assert decision == {
         "is_blocked": True,
+        "category": "regulated_advice",
         "reason": "The user is asking for a personal recommendation.",
         "refusal_message": guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
     }
     assert recorded_events[0].severity == "WARNING"
     assert recorded_events[0].user_id == "account-123"
-    assert recorded_events[0].source == "fca_advice_boundary"
+    assert recorded_events[0].source == "regulated_advice"
     assert recorded_events[0].details == {
-        "direction": "advice_boundary",
+        "direction": "policy_boundary",
         "decision": "blocked",
-        "rail": "fca_advice_boundary",
-        "reason": "LLM classified request as seeking regulated personal investment advice.",
+        "rail": "regulated_advice",
+        "reason": "LLM classified the request as blocked by the chat policy.",
     }
     assert query_text not in str(recorded_events[0].details)
     assert "Latest user query" in rails.advice_prompts[0]
@@ -1213,7 +1254,7 @@ def test_advice_boundary_checks_conversation_context(monkeypatch):
         [
             json.dumps(
                 {
-                    "is_blocked": False,
+                    "category": "allow",
                     "reason": "This is a simple balance check.",
                 }
             )
@@ -1234,8 +1275,9 @@ def test_advice_boundary_checks_conversation_context(monkeypatch):
 
     assert decision == {
         "is_blocked": False,
+        "category": "allow",
         "reason": "This is a simple balance check.",
-        "refusal_message": guardrails.ADVICE_BOUNDARY_REFUSAL_MESSAGE,
+        "refusal_message": guardrails.REFUSAL_MESSAGE,
     }
     assert json.dumps(history) in rails.advice_prompts[0]
 
@@ -1247,7 +1289,7 @@ def test_advice_boundary_blocks_personal_recommendation_in_balance_context(monke
         [
             json.dumps(
                 {
-                    "is_blocked": True,
+                    "category": "regulated_advice",
                     "reason": "The user asks whether to buy a specific asset.",
                 }
             )
@@ -1278,7 +1320,7 @@ def test_advice_boundary_allows_transfer_affordability_followup(monkeypatch):
         [
             json.dumps(
                 {
-                    "is_blocked": False,
+                    "category": "allow",
                     "reason": "The user is checking whether their balance covers a transfer.",
                 }
             )
@@ -1302,7 +1344,7 @@ def test_advice_boundary_allows_transfer_affordability_followup(monkeypatch):
 
     assert decision["is_blocked"] is False
     assert json.dumps(history) in rails.advice_prompts[0]
-    assert "ordinary banking, not investment advice" in rails.advice_prompts[0]
+    assert "balance can cover a bank transfer is ordinary banking" in rails.advice_prompts[0]
     assert "Is it enough to transfer 500?" in rails.advice_prompts[0]
 
 
@@ -1323,7 +1365,8 @@ def test_advice_boundary_accepts_structured_json_wrapped_in_markdown(monkeypatch
     rails = FakeRails([])
     rails.advice_evaluations = iter(
         [
-            '```json\n{"is_blocked": true, "reason": "Specific investment advice."}\n```'
+            '```json\n{"category": "regulated_advice", '
+            '"reason": "Specific investment advice."}\n```'
         ]
     )
     monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
@@ -1390,16 +1433,24 @@ def test_chat_intent_classifier_fails_closed_on_invalid_output():
 
 
 @pytest.mark.parametrize(
-    ("model_output", "expected_blocked"),
+    ("model_output", "expected_category"),
     [
-        ("BLOCK: Personal investment advice requested.", True),
-        ("ALLOW: General banking question.", False),
-        ("Yes", True),
-        ("No.", False),
+        (
+            '{"category":"regulated_advice","reason":"Personal investment advice."}',
+            "regulated_advice",
+        ),
+        (
+            '{"category":"off_topic","reason":"Unrelated to banking support."}',
+            "off_topic",
+        ),
+        (
+            '{"category":"allow","reason":"General banking question."}',
+            "allow",
+        ),
     ],
 )
-def test_advice_boundary_accepts_explicit_plain_text_decisions(
-    monkeypatch, model_output, expected_blocked
+def test_advice_boundary_accepts_semantic_policy_categories(
+    monkeypatch, model_output, expected_category
 ):
     monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
     rails = FakeRails([])
@@ -1412,8 +1463,47 @@ def test_advice_boundary_accepts_explicit_plain_text_decisions(
         )
     )
 
-    assert decision["is_blocked"] is expected_blocked
+    assert decision["category"] == expected_category
+    assert decision["is_blocked"] is (expected_category != "allow")
     assert decision["reason"]
+
+
+def test_off_topic_request_returns_general_refusal_not_fca_refusal(monkeypatch):
+    monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
+
+    async def unexpected_input_check(*args, **kwargs):
+        raise AssertionError("Off-topic requests should be blocked before input check")
+
+    monkeypatch.setattr(orchestrator_main, "check_input", unexpected_input_check)
+    rails = FakeRails([])
+    rails.advice_evaluations = iter(
+        [
+            json.dumps(
+                {
+                    "category": "off_topic",
+                    "reason": "The request is unrelated to banking support.",
+                }
+            )
+        ]
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_response(
+                "token",
+                "account-123",
+                "tell me a story",
+                guardrails=rails,
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        {"type": "content", "content": guardrails.REFUSAL_MESSAGE},
+        {"type": "completion"},
+    ]
 
 
 def test_blocked_advice_boundary_suppresses_model_and_returns_regulatory_refusal(
@@ -1434,7 +1524,8 @@ def test_blocked_advice_boundary_suppresses_model_and_returns_regulatory_refusal
     rails = FakeRails([])
     rails.advice_evaluations = iter(
         [
-            '{"is_blocked": true, "reason": "Personal asset advice requested."}'
+            '{"category": "regulated_advice", '
+            '"reason": "Personal asset advice requested."}'
         ]
     )
 

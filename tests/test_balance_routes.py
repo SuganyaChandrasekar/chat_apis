@@ -960,7 +960,10 @@ def test_contextual_sufficiency_followup_checks_current_balance(monkeypatch) -> 
 
     class FakeRails:
         async def generate_async(self, prompt, **kwargs):
-            return '{"is_blocked": false, "reason": "Bank balance feasibility question."}'
+            return (
+                '{"category": "allow", '
+                '"reason": "Bank balance feasibility question."}'
+            )
 
         async def check_async(self, messages, **kwargs):
             assert messages[-1]["role"] == "user"
