@@ -1569,7 +1569,7 @@ async def _stream_response(
     if conversation_id:
         state["conversation_id"] = conversation_id
     logger.info("Chat message prepared")
-    graph = build_agent_graph(token, account_id)
+    graph = await asyncio.to_thread(build_agent_graph, token, account_id)
     logger.info("Chat agent graph built")
     response_content = []
     deferred_events = []

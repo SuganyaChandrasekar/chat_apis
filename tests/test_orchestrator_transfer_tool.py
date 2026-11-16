@@ -279,7 +279,11 @@ def test_prepare_transfer_refuses_frozen_source_before_preview(monkeypatch) -> N
             return httpx.Response(200, request=request, json=accounts)
 
     monkeypatch.setattr(agent.httpx, "AsyncClient", FakeAsyncClient)
-    prepare_transfer = agent.build_agent_tools("validated-token", "sandbox-checking-001")[1]
+    prepare_transfer = next(
+        tool
+        for tool in agent.build_agent_tools("validated-token", "sandbox-checking-001")
+        if tool.name == "prepare_transfer"
+    )
     result = asyncio.run(
         prepare_transfer.ainvoke(
             {
@@ -328,7 +332,11 @@ def test_prepare_transfer_reports_insufficient_balance(monkeypatch) -> None:
             )
 
     monkeypatch.setattr(agent.httpx, "AsyncClient", FakeAsyncClient)
-    prepare_transfer = agent.build_agent_tools(token, "sandbox-checking-001")[1]
+    prepare_transfer = next(
+        tool
+        for tool in agent.build_agent_tools(token, "sandbox-checking-001")
+        if tool.name == "prepare_transfer"
+    )
     result = asyncio.run(
         prepare_transfer.ainvoke(
             {
@@ -370,9 +378,11 @@ def test_prepare_transfer_reports_insufficient_balance(monkeypatch) -> None:
 
 
 def test_prepare_transfer_asks_for_missing_entities() -> None:
-    prepare_transfer = agent.build_agent_tools(
-        "validated-token", "sandbox-checking-001"
-    )[1]
+    prepare_transfer = next(
+        tool
+        for tool in agent.build_agent_tools("validated-token", "sandbox-checking-001")
+        if tool.name == "prepare_transfer"
+    )
 
     source_question = asyncio.run(prepare_transfer.ainvoke({}))
     recipient_question = asyncio.run(

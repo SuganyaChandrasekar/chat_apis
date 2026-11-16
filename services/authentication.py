@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import jwt
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 JWT_ISSUER = "banking-auth"
 JWT_AUDIENCE = "banking-api"
@@ -23,6 +24,7 @@ SANDBOX_SCOPES = frozenset(
         "chat:respond",
     }
 )
+_bearer_security = HTTPBearer(auto_error=False)
 
 
 class JwtConfigurationError(Exception):
@@ -259,6 +261,38 @@ def bearer_token(authorization: str | None) -> str:
     if not separator or scheme.lower() != "bearer" or not token:
         raise InvalidAccessToken
     return token
+
+
+def require_any_scope(scopes: Iterable[str]):
+    required_scopes = frozenset(scopes)
+    if not required_scopes:
+        raise ValueError("At least one required scope must be provided")
+
+    def dependency(
+        credentials: HTTPAuthorizationCredentials | None = Security(_bearer_security),
+    ) -> str:
+        try:
+            authorization = (
+                None
+                if credentials is None
+                else f"{credentials.scheme} {credentials.credentials}"
+            )
+            context = validate_access_context(bearer_token(authorization))
+        except JwtConfigurationError:
+            raise HTTPException(
+                status_code=503, detail="Authentication is not configured"
+            ) from None
+        except InvalidAccessToken:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from None
+        if not required_scopes.intersection(context.scopes):
+            raise HTTPException(status_code=403, detail="Required permission is not granted")
+        return context.subject
+
+    return dependency
 
 
 def authenticated_subject(authorization: str | None = Header(default=None)) -> str:

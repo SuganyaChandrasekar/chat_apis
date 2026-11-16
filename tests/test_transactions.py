@@ -148,7 +148,11 @@ def test_recent_transactions_tool_forwards_auth_and_filters(monkeypatch) -> None
             )
 
     monkeypatch.setattr(agent.httpx, "AsyncClient", FakeAsyncClient)
-    tool = agent.build_agent_tools(token, "sandbox-checking-001")[2]
+    tool = next(
+        tool
+        for tool in agent.build_agent_tools(token, "sandbox-checking-001")
+        if tool.name == "get_recent_transactions"
+    )
     result = asyncio.run(
         tool.ainvoke(
             {

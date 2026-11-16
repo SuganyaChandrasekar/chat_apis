@@ -7,6 +7,7 @@ This repository contains independently deployable FastAPI services:
 - `transfer`: private transfer workflow service.
 - `cards`: sandbox card-management service.
 - `fraud`: sandbox fraud-case service.
+- `capabilities`: authenticated capability manifest registry, certification, and rollout service.
 
 ## Run locally
 
@@ -29,9 +30,20 @@ python -m uvicorn services.transfer.main:app --reload --port 8002
 python -m uvicorn services.cards.main:app --reload --port 8004
 python -m uvicorn services.fraud.main:app --reload --port 8005
 python -m uvicorn services.mfa.main:app --reload --port 8003 --env-file .env
+python -m uvicorn services.capabilities.main:app --reload --port 8006 --env-file .env
 ```
 
 Each service exposes a health endpoint at its local port, for example `http://localhost:8001/health` for the balance service.
+
+## Capability registry (EP10)
+
+Run `alembic upgrade head` with `DATABASE_URL` configured before starting the capability registry. Registry write endpoints require a valid bearer JWT containing either `admin:capabilities` or `lob:publisher`; the capability service also requires configured NeMo Guardrails (`GEMINI_API_KEY`) and fails closed when guardrails are unavailable.
+
+`POST /capabilities` accepts a `manifest` matching [`schemas/manifest_schema.json`](./schemas/manifest_schema.json) and 1-200 `evaluation_cases`. Each evaluation case has a `prompt`, `expected_response`, and `actual_response`. The registry runs semantic input/output guardrails on the manifest and test content, then computes deterministic normalized exact-match accuracy; only guardrail-passing versions with score >= 0.95 are certified. The `actual_response` values must come from a trusted capability test runner; the registry deliberately does not import or execute a manifest-supplied entrypoint.
+
+Certified versions are initially assigned to the `internal_beta` cohort behind an enabled per-version feature flag, with 0% general traffic. Authenticated consumers can use `GET /capabilities/{capability_id}/route?cohort=general|internal_beta` to resolve a certified version. `POST /capabilities/{capability_id}/versions/{version}/promote` promotes only certified versions that meet the absolute score threshold and do not regress against the current production score. A rejected promotion leaves the active production version unchanged. The registry's `resolve_capability` module function applies the same routing gates for internal use.
+
+The EP10 migration seeds the existing `check_balance`, `prepare_transfer`, and `get_recent_transactions` tools as active built-ins. The orchestrator loads certified production manifests from the capability registry store when building the graph, binds the delegated access token and authenticated account to each registered entrypoint, and exposes tools based on their manifest `routing.intents`. Entry points must resolve to decorated async functions in `services.orchestrator.agent`; manifest text cannot select arbitrary Python modules or functions. Registry database access must be configured for the orchestrator as well as the registry service.
 
 ## JWT authentication
 

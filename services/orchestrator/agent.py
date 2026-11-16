@@ -1,9 +1,13 @@
 import asyncio
+import importlib
+import inspect
 import json
 import logging
 import os
+from collections.abc import Callable
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Any, TypeVar
 from uuid import uuid4
 from urllib.parse import quote
 
@@ -16,7 +20,8 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool
+from langchain_core.tools.base import create_schema_from_function
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, ValidationError
@@ -31,10 +36,14 @@ from services.authorization import (
     HIGH_VALUE_TRANSFER_THRESHOLD,
     record_authorization_decision,
 )
+from services.capabilities.contracts import CapabilityManifest
+from services.capabilities.store import list_routable_capabilities
 
 logger = logging.getLogger("uvicorn.error")
 
 MAX_CONVERSATION_MESSAGES = 20
+CapabilityEntrypoint = TypeVar("CapabilityEntrypoint", bound=Callable[..., Any])
+
 
 class BalanceFinancialPayload(BaseModel):
     kind: str = "balance"
@@ -199,230 +208,293 @@ def _transaction_date_range(date_hint: str | None) -> tuple[date | None, date | 
     return parsed_date, today
 
 
-def build_agent_tools(access_token: str, account_id: str):
-    default_account_id = account_id
+def capability_entrypoint(
+    required_scope: str,
+) -> Callable[[CapabilityEntrypoint], CapabilityEntrypoint]:
+    def decorate(function: CapabilityEntrypoint) -> CapabilityEntrypoint:
+        setattr(function, "capability_required_scope", required_scope)
+        return function
 
-    @tool
-    async def check_balance() -> str:
-        """Get the authenticated customer's account balance."""
-        balance_url = os.getenv("BALANCE_SERVICE_URL", "http://localhost:8001")
+    return decorate
 
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(
-                    f"{balance_url.rstrip('/')}/sandbox/balances/{quote(account_id, safe='')}",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-                response.raise_for_status()
-                balance = response.json()
-                return json.dumps(
-                    {
-                        "kind": "balance",
-                        "account_id": account_id,
-                        "balance": balance["balance"],
-                        "currency": balance["currency"],
-                    }
-                )
-        except (httpx.RequestError, httpx.HTTPStatusError, KeyError, TypeError, ValueError):
-            return "Balance information is currently unavailable."
 
-    @tool
-    async def prepare_transfer(
-        source_account: str | None = None,
-        recipient: str | None = None,
-        amount: str | None = None,
-    ) -> str:
-        """Prepare a transfer preview. Never confirm a transfer or supply an OTP."""
-        if not source_account:
-            return "Which linked account would you like to transfer from?"
-        if not recipient:
-            return "Which linked account should receive the transfer?"
-        if amount is None:
-            return "What amount would you like to transfer?"
+def _bind_tool_context(
+    function: Callable[..., Any], access_token: str, account_id: str
+) -> Callable[..., Any]:
+    async def invoke_tool(**kwargs: Any) -> Any:
+        return await function(access_token, account_id, **kwargs)
 
-        try:
-            requested_amount = Decimal(str(amount))
-            transfer_amount = requested_amount.quantize(Decimal("0.01"))
-        except (InvalidOperation, ValueError):
-            return "Please provide a valid transfer amount."
-        if (
-            not transfer_amount.is_finite()
-            or transfer_amount <= 0
-            or requested_amount != transfer_amount
-        ):
-            return "Transfer amount must be greater than zero."
+    return invoke_tool
 
-        balance_url = os.getenv("BALANCE_SERVICE_URL", "http://localhost:8001")
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(
-                    f"{balance_url.rstrip('/')}/sandbox/accounts",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-                response.raise_for_status()
-                accounts = response.json()
-            if not isinstance(accounts, list) or any(
-                not isinstance(account, dict)
-                or not isinstance(account.get("account_id"), str)
-                or not isinstance(account.get("label"), str)
-                for account in accounts
-            ):
-                return "Linked account information is currently unavailable."
-        except (httpx.RequestError, httpx.HTTPStatusError, ValueError, TypeError):
-            return "Linked account information is currently unavailable."
 
-        source = _resolve_linked_account(source_account, accounts)
-        if source is None:
-            return "I couldn't match that source to one of your linked accounts. Which account should the transfer come from?"
-        if source.get("status", "ACTIVE") != "ACTIVE":
-            return "This source account is frozen and cannot send transfers."
-        destination = _resolve_linked_account(recipient, accounts)
-        if destination is None:
-            return "I couldn't match that recipient to one of your linked sandbox accounts. Transfers to external payees aren't configured here."
-        if source["account_id"] not in {account["account_id"] for account in accounts}:
-            return "That source account isn't authorized for this session."
-        if source["account_id"] == destination["account_id"]:
-            return "Choose a different linked account as the recipient."
+@capability_entrypoint("account:read")
+async def check_balance(access_token: str, account_id: str) -> str:
+    """Get the authenticated customer's account balance."""
+    balance_url = os.getenv("BALANCE_SERVICE_URL", "http://localhost:8001")
 
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(
-                    f"{balance_url.rstrip('/')}/sandbox/balances/"
-                    f"{quote(source['account_id'], safe='')}",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-                response.raise_for_status()
-                balance_payload = response.json()
-                available_balance = Decimal(str(balance_payload["balance"]))
-                if (
-                    balance_payload.get("account_id") != source["account_id"]
-                    or balance_payload.get("currency") != "USD"
-                    or not available_balance.is_finite()
-                    or available_balance < 0
-                ):
-                    return "Source account balance is currently unavailable."
-        except (httpx.RequestError, httpx.HTTPStatusError, ValueError, TypeError, KeyError):
-            return "Source account balance is currently unavailable."
-
-        if transfer_amount > available_balance:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{balance_url.rstrip('/')}/sandbox/balances/{quote(account_id, safe='')}",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            response.raise_for_status()
+            balance = response.json()
             return json.dumps(
                 {
-                    "kind": "transfer_error",
+                    "kind": "balance",
                     "account_id": account_id,
-                    "message": (
-                        "Insufficient balance. Available balance is "
-                        f"USD {available_balance:.2f}."
-                    ),
+                    "balance": balance["balance"],
+                    "currency": balance["currency"],
                 }
             )
+    except (httpx.RequestError, httpx.HTTPStatusError, KeyError, TypeError, ValueError):
+        return "Balance information is currently unavailable."
 
+
+@capability_entrypoint("transfer:prepare")
+async def prepare_transfer(
+    access_token: str,
+    account_id: str,
+    source_account: str | None = None,
+    recipient: str | None = None,
+    amount: str | None = None,
+) -> str:
+    """Prepare a transfer preview. Never confirm a transfer or supply an OTP."""
+    if not source_account:
+        return "Which linked account would you like to transfer from?"
+    if not recipient:
+        return "Which linked account should receive the transfer?"
+    if amount is None:
+        return "What amount would you like to transfer?"
+
+    try:
+        requested_amount = Decimal(str(amount))
+        transfer_amount = requested_amount.quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        return "Please provide a valid transfer amount."
+    if (
+        not transfer_amount.is_finite()
+        or transfer_amount <= 0
+        or requested_amount != transfer_amount
+    ):
+        return "Transfer amount must be greater than zero."
+
+    balance_url = os.getenv("BALANCE_SERVICE_URL", "http://localhost:8001")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{balance_url.rstrip('/')}/sandbox/accounts",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            response.raise_for_status()
+            accounts = response.json()
+        if not isinstance(accounts, list) or any(
+            not isinstance(account, dict)
+            or not isinstance(account.get("account_id"), str)
+            or not isinstance(account.get("label"), str)
+            for account in accounts
+        ):
+            return "Linked account information is currently unavailable."
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError, TypeError):
+        return "Linked account information is currently unavailable."
+
+    source = _resolve_linked_account(source_account, accounts)
+    if source is None:
+        return "I couldn't match that source to one of your linked accounts. Which account should the transfer come from?"
+    if source.get("status", "ACTIVE") != "ACTIVE":
+        return "This source account is frozen and cannot send transfers."
+    destination = _resolve_linked_account(recipient, accounts)
+    if destination is None:
+        return "I couldn't match that recipient to one of your linked sandbox accounts. Transfers to external payees aren't configured here."
+    if source["account_id"] not in {account["account_id"] for account in accounts}:
+        return "That source account isn't authorized for this session."
+    if source["account_id"] == destination["account_id"]:
+        return "Choose a different linked account as the recipient."
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{balance_url.rstrip('/')}/sandbox/balances/"
+                f"{quote(source['account_id'], safe='')}",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            response.raise_for_status()
+            balance_payload = response.json()
+            available_balance = Decimal(str(balance_payload["balance"]))
+            if (
+                balance_payload.get("account_id") != source["account_id"]
+                or balance_payload.get("currency") != "USD"
+                or not available_balance.is_finite()
+                or available_balance < 0
+            ):
+                return "Source account balance is currently unavailable."
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError, TypeError, KeyError):
+        return "Source account balance is currently unavailable."
+
+    if transfer_amount > available_balance:
         return json.dumps(
             {
-                "kind": "transfer_confirmation",
-                "request_id": str(uuid4()),
+                "kind": "transfer_error",
                 "account_id": account_id,
-                "source_account_id": source["account_id"],
-                "source_account": source["label"],
-                "destination_account_id": destination["account_id"],
-                "destination_account": destination["label"],
-                "amount": str(transfer_amount),
-                "currency": "USD",
-                "mfa_required": transfer_amount >= HIGH_VALUE_TRANSFER_THRESHOLD,
+                "message": (
+                    "Insufficient balance. Available balance is "
+                    f"USD {available_balance:.2f}."
+                ),
             }
         )
 
-    @tool
-    async def get_recent_transactions(
-        account_id: str | None = None,
-        limit: int = 10,
-        date_hint: str | None = None,
-        merchant_hint: str | None = None,
-    ) -> str:
-        """Get recent transactions for one of the customer's linked sandbox accounts.
+    return json.dumps(
+        {
+            "kind": "transfer_confirmation",
+            "request_id": str(uuid4()),
+            "account_id": account_id,
+            "source_account_id": source["account_id"],
+            "source_account": source["label"],
+            "destination_account_id": destination["account_id"],
+            "destination_account": destination["label"],
+            "amount": str(transfer_amount),
+            "currency": "USD",
+            "mfa_required": transfer_amount >= HIGH_VALUE_TRANSFER_THRESHOLD,
+        }
+    )
 
-        Use the linked account name (such as "checking" or "savings") when the user
-        specifies an account. Do not invent account IDs or transaction details.
-        """
-        if not 1 <= limit <= 100:
-            return "Please request between 1 and 100 transactions."
-        date_from, date_to = _transaction_date_range(date_hint)
-        if date_hint and date_from is None:
-            return (
-                "I couldn't interpret that date range. Please specify a date or "
-                "period such as this month."
+
+@capability_entrypoint("transactions:read")
+async def get_recent_transactions(
+    access_token: str,
+    default_account_id: str,
+    account_id: str | None = None,
+    limit: int = 10,
+    date_hint: str | None = None,
+    merchant_hint: str | None = None,
+) -> str:
+    """Get recent transactions for one of the customer's linked sandbox accounts.
+
+    Use the linked account name (such as "checking" or "savings") when the user
+    specifies an account. Do not invent account IDs or transaction details.
+    """
+    if not 1 <= limit <= 100:
+        return "Please request between 1 and 100 transactions."
+    date_from, date_to = _transaction_date_range(date_hint)
+    if date_hint and date_from is None:
+        return (
+            "I couldn't interpret that date range. Please specify a date or "
+            "period such as this month."
+        )
+
+    balance_url = os.getenv("BALANCE_SERVICE_URL", "http://localhost:8001")
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            accounts_response = await client.get(
+                f"{balance_url.rstrip('/')}/sandbox/accounts",
+                headers=headers,
             )
+            accounts_response.raise_for_status()
+            accounts = accounts_response.json()
+            if not isinstance(accounts, list) or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("account_id"), str)
+                or not isinstance(item.get("label"), str)
+                for item in accounts
+            ):
+                raise ValueError("Invalid linked-account response")
 
-        balance_url = os.getenv("BALANCE_SERVICE_URL", "http://localhost:8001")
-        headers = {"Authorization": f"Bearer {access_token}"}
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                accounts_response = await client.get(
-                    f"{balance_url.rstrip('/')}/sandbox/accounts",
-                    headers=headers,
+            selected = (
+                _resolve_linked_account(account_id, accounts)
+                if account_id
+                else next(
+                    (
+                        item
+                        for item in accounts
+                        if item["account_id"] == default_account_id
+                    ),
+                    None,
                 )
-                accounts_response.raise_for_status()
-                accounts = accounts_response.json()
-                if not isinstance(accounts, list) or any(
-                    not isinstance(item, dict)
-                    or not isinstance(item.get("account_id"), str)
-                    or not isinstance(item.get("label"), str)
-                    for item in accounts
-                ):
-                    raise ValueError("Invalid linked-account response")
-
-                selected = (
-                    _resolve_linked_account(account_id, accounts)
-                    if account_id
-                    else next(
-                        (
-                            item
-                            for item in accounts
-                            if item["account_id"] == default_account_id
-                        ),
-                        None,
+            )
+            if selected is None and not account_id and len(accounts) == 1:
+                selected = accounts[0]
+            if selected is None:
+                if account_id:
+                    return (
+                        "I couldn't match that to one of your linked accounts. "
+                        "Which account should I check?"
                     )
-                )
-                if selected is None and not account_id and len(accounts) == 1:
-                    selected = accounts[0]
-                if selected is None:
-                    if account_id:
-                        return (
-                            "I couldn't match that to one of your linked accounts. "
-                            "Which account should I check?"
-                        )
-                    return "Which linked account would you like me to check?"
+                return "Which linked account would you like me to check?"
 
-                params: dict[str, str | int] = {"limit": limit}
-                if date_from is not None:
-                    params["date_from"] = date_from.isoformat()
-                if date_to is not None:
-                    params["date_to"] = date_to.isoformat()
-                if merchant_hint:
-                    params["merchant"] = merchant_hint[:128]
-                response = await client.get(
-                    f"{balance_url.rstrip('/')}/accounts/"
-                    f"{quote(selected['account_id'], safe='')}/transactions",
-                    headers=headers,
-                    params=params,
-                )
-                response.raise_for_status()
-                payload = RecentTransactionsPayload(
-                    account_id=selected["account_id"],
-                    transactions=response.json(),
-                )
-        except (httpx.RequestError, httpx.HTTPStatusError):
-            return "Transaction information is currently unavailable."
-        except (ValueError, TypeError, ValidationError):
-            return "Transaction information is currently unavailable."
+            params: dict[str, str | int] = {"limit": limit}
+            if date_from is not None:
+                params["date_from"] = date_from.isoformat()
+            if date_to is not None:
+                params["date_to"] = date_to.isoformat()
+            if merchant_hint:
+                params["merchant"] = merchant_hint[:128]
+            response = await client.get(
+                f"{balance_url.rstrip('/')}/accounts/"
+                f"{quote(selected['account_id'], safe='')}/transactions",
+                headers=headers,
+                params=params,
+            )
+            response.raise_for_status()
+            payload = RecentTransactionsPayload(
+                account_id=selected["account_id"],
+                transactions=response.json(),
+            )
+    except (httpx.RequestError, httpx.HTTPStatusError):
+        return "Transaction information is currently unavailable."
+    except (ValueError, TypeError, ValidationError):
+        return "Transaction information is currently unavailable."
 
-        return payload.model_dump_json()
+    return payload.model_dump_json()
 
-    return [check_balance, prepare_transfer, get_recent_transactions]
+
+def build_agent_tools(access_token: str, account_id: str) -> list[StructuredTool]:
+    tools = []
+    for record in list_routable_capabilities(cohort="general"):
+        manifest = CapabilityManifest.model_validate(record.manifest)
+        module_name, separator, function_name = manifest.entrypoint.partition(":")
+        if not separator or module_name != __name__:
+            raise RuntimeError("Capability entrypoint is outside the trusted tool module")
+
+        function = getattr(importlib.import_module(module_name), function_name, None)
+        required_scope = getattr(function, "capability_required_scope", None)
+        if (
+            not inspect.iscoroutinefunction(function)
+            or required_scope is None
+            or manifest.capability_id != function_name
+        ):
+            raise RuntimeError("Capability entrypoint is not a trusted async tool")
+
+        runtime_parameters = list(inspect.signature(function).parameters)[:2]
+        args_schema = create_schema_from_function(
+            manifest.capability_id,
+            function,
+            filter_args=runtime_parameters,
+        )
+
+        tools.append(
+            StructuredTool(
+                name=manifest.capability_id,
+                description=manifest.description,
+                args_schema=args_schema,
+                coroutine=_bind_tool_context(function, access_token, account_id),
+                metadata={
+                    "required_scope": required_scope,
+                    "routing_intents": tuple(manifest.routing.intents),
+                },
+            )
+        )
+    return tools
 
 
 def build_agent_graph(access_token: str, account_id: str):
     tools = build_agent_tools(access_token, account_id)
     tools_by_name = {registered_tool.name: registered_tool for registered_tool in tools}
+    tools_by_intent: dict[str, list[StructuredTool]] = {}
+    for registered_tool in tools:
+        for routed_intent in registered_tool.metadata["routing_intents"]:
+            tools_by_intent.setdefault(routed_intent, []).append(registered_tool)
 
     async def call_model(state: ChatState) -> dict:
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -433,13 +505,7 @@ def build_agent_graph(access_token: str, account_id: str):
         model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
         logger.info("Starting Gemini request with model %s", model_name)
         intent = state.get("intent")
-        available_tools = []
-        if intent == "transfer_request":
-            available_tools = [tools_by_name["prepare_transfer"]]
-        elif intent == "transaction_history":
-            available_tools = [tools_by_name["get_recent_transactions"]]
-        elif intent == "balance_check":
-            available_tools = [tools_by_name["check_balance"]]
+        available_tools = tools_by_intent.get(intent, [])
         model = ChatGoogleGenerativeAI(
             model=model_name,
             google_api_key=api_key,
@@ -559,11 +625,11 @@ def build_agent_graph(access_token: str, account_id: str):
             else:
                 logger.info("Executing agent tool %s", call["name"])
                 try:
-                    required_scope = {
-                        "check_balance": "account:read",
-                        "prepare_transfer": "transfer:prepare",
-                        "get_recent_transactions": "transactions:read",
-                    }.get(call["name"])
+                    required_scope = (
+                        registered_tool.metadata.get("required_scope")
+                        if registered_tool.metadata
+                        else None
+                    )
                     if required_scope is None:
                         raise AuthorizationDenied
                     context = authorize_access_token(

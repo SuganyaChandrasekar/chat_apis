@@ -1,0 +1,24 @@
+{
+  "manifest": {
+    "capability_id": "ep10_registry_smoke_test",
+    "version": "1.0.0",
+    "display_name": "EP-10 registry smoke test",
+    "description": "Smoke test for capability registration and beta routing.",
+    "entrypoint": "services.orchestrator.agent:ep10_registry_smoke_test",
+    "routing": {
+      "intents": ["ep10_registry_smoke_test"],
+      "keywords": []
+    },
+    "schema": {
+      "required_inputs": [],
+      "output_type": "string"
+    }
+  },
+  "evaluation_cases": [
+   {
+  "prompt": "Reply with the exact text: EP-10 smoke test passed",
+  "expected_response": "EP-10 smoke test passed",
+  "actual_response": "EP-10 smoke test passed"
+}
+  ]
+}
