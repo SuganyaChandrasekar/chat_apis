@@ -15,6 +15,12 @@ from services.authentication import (
 )
 from services.authorization import create_sca_attestation, transfer_action_id
 from services.sandbox import SANDBOX_INITIAL_BALANCES, SandboxTransferRequest
+from services.sandbox_balance_store import (
+    SandboxBalanceBase,
+    SandboxBalanceStoreUnavailable,
+    execute_sandbox_transfer,
+    get_sandbox_balance,
+)
 from services.transfer import main as transfer_service
 from services.transfer import audit as transfer_audit
 from services.transfer.audit import (
@@ -35,9 +41,16 @@ def _transfer(source_account_id: str, amount: str, otp_code: str | None = None):
 
 
 @pytest.fixture(autouse=True)
-def transfer_authorization(monkeypatch):
+def transfer_authorization(monkeypatch, tmp_path):
     monkeypatch.setenv("JWT_SECRET", "transfer-security-test-secret-32-bytes")
     monkeypatch.setenv("SANDBOX_MODE", "true")
+    engine = create_engine(f"sqlite:///{tmp_path / 'transfer.db'}")
+    SandboxBalanceBase.metadata.create_all(engine)
+    TransferAuditEvent.__table__.create(engine)
+    monkeypatch.setattr(transfer_audit, "_engine", lambda: engine)
+    monkeypatch.setattr(
+        "services.sandbox_balance_store._engine", lambda: engine
+    )
     token = create_access_token(
         "sandbox-checking-001",
         scopes=("transfer:execute",),
@@ -51,7 +64,6 @@ def _authorization(monkeypatch) -> str:
 
 
 def test_frozen_source_is_blocked_and_audited(monkeypatch) -> None:
-    monkeypatch.setattr(transfer_service, "balances", SANDBOX_INITIAL_BALANCES.copy())
     monkeypatch.setattr(
         transfer_service,
         "begin_transfer",
@@ -83,11 +95,10 @@ def test_frozen_source_is_blocked_and_audited(monkeypatch) -> None:
     assert error.value.detail.startswith("ACCOUNT_FROZEN:")
     assert audit_statuses[0]["status"] == "FAILED"
     assert audit_statuses[0]["sca_state"] == "NOT_REQUIRED"
-    assert transfer_service.balances["sandbox-savings-001"] == Decimal("3200.00")
+    assert get_sandbox_balance("sandbox-savings-001").balance == Decimal("3200.00")
 
 
 def test_high_value_transfer_requires_otp_and_is_audited(monkeypatch) -> None:
-    monkeypatch.setattr(transfer_service, "balances", SANDBOX_INITIAL_BALANCES.copy())
     monkeypatch.setattr(
         transfer_service,
         "begin_transfer",
@@ -114,11 +125,10 @@ def test_high_value_transfer_requires_otp_and_is_audited(monkeypatch) -> None:
     assert "retry in your bank's secure verification flow or cancel" in error.value.detail
     assert audit_statuses[0]["status"] == "FAILED"
     assert audit_statuses[0]["sca_state"] == "ABANDONED"
-    assert transfer_service.balances["sandbox-savings-001"] == Decimal("3200.00")
+    assert get_sandbox_balance("sandbox-savings-001").balance == Decimal("3200.00")
 
 
 def test_insufficient_balance_is_rejected_before_mfa_verification(monkeypatch) -> None:
-    monkeypatch.setattr(transfer_service, "balances", SANDBOX_INITIAL_BALANCES.copy())
     monkeypatch.setattr(
         transfer_service,
         "begin_transfer",
@@ -157,13 +167,15 @@ def test_insufficient_balance_is_rejected_before_mfa_verification(monkeypatch) -
     assert error.value.status_code == 409
     assert error.value.detail.startswith("INSUFFICIENT_FUNDS:")
     assert audit_statuses == ["FAILED"]
-    assert transfer_service.balances == SANDBOX_INITIAL_BALANCES
+    assert {
+        account_id: get_sandbox_balance(account_id).balance
+        for account_id in SANDBOX_INITIAL_BALANCES
+    } == SANDBOX_INITIAL_BALANCES
 
 
 def test_high_value_transfer_executes_only_with_matching_sca_attestation(
     monkeypatch,
 ) -> None:
-    transfer_service.balances = SANDBOX_INITIAL_BALANCES.copy()
     monkeypatch.setattr(
         transfer_service,
         "begin_transfer",
@@ -233,10 +245,41 @@ def test_high_value_transfer_executes_only_with_matching_sca_attestation(
     )
 
     assert result.status == "SUCCESS"
-    assert audit_events[-1]["status"] == "SUCCESS"
-    assert audit_events[-1]["consent_state"] == "GRANTED"
-    assert audit_events[-1]["sca_state"] == "VERIFIED"
-    assert transfer_service.balances["sandbox-checking-001"] == Decimal("500.00")
+    with Session(transfer_audit._engine()) as session:
+        success_event = session.query(TransferAuditEvent).filter_by(
+            transaction_id="sca-transaction",
+            status="SUCCESS",
+        ).one()
+    assert success_event.consent_state == "GRANTED"
+    assert success_event.sca_state == "VERIFIED"
+    assert get_sandbox_balance("sandbox-checking-001").balance == Decimal("500.00")
+    assert get_sandbox_balance("sandbox-savings-001").balance == Decimal("4200.00")
+
+
+def test_balance_updates_roll_back_when_success_event_cannot_be_recorded() -> None:
+    get_sandbox_balance("sandbox-checking-001")
+    engine = transfer_audit._engine()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TRIGGER reject_success_audit BEFORE INSERT "
+            "ON transfer_audit_events WHEN NEW.status = 'SUCCESS' "
+            "BEGIN SELECT RAISE(ABORT, 'audit insert rejected'); END"
+        )
+
+    with pytest.raises(SandboxBalanceStoreUnavailable):
+        execute_sandbox_transfer(
+            transaction_id="rollback-transaction",
+            account_id="sandbox-checking-001",
+            idempotency_key="rollback-key",
+            source_account_id="sandbox-checking-001",
+            destination_account_id="sandbox-savings-001",
+            amount=Decimal("10.00"),
+            currency="USD",
+            sca_state="NOT_REQUIRED",
+        )
+
+    assert get_sandbox_balance("sandbox-checking-001").balance == Decimal("1500.00")
+    assert get_sandbox_balance("sandbox-savings-001").balance == Decimal("3200.00")
 
 
 def test_latest_transfer_returns_account_ids_for_authenticated_customer(monkeypatch):

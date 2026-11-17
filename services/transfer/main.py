@@ -27,7 +27,6 @@ from services.authorization import (
 from services.sandbox import (
     SANDBOX_CURRENCY,
     SANDBOX_CUSTOMER_ACCOUNTS,
-    SANDBOX_INITIAL_BALANCES,
     SandboxTransferRequest,
     SandboxTransferResponse,
     require_sandbox_mode,
@@ -40,11 +39,16 @@ from services.transfer.audit import (
     begin_transfer,
     latest_successful_transfer,
 )
+from services.sandbox_balance_store import (
+    SandboxAccountNotFound,
+    SandboxBalanceStoreUnavailable,
+    SandboxInsufficientFunds,
+    execute_sandbox_transfer,
+    get_sandbox_balance,
+)
 
 app = FastAPI(title="Transfer Service", version="0.1.0")
 register_exception_handlers(app)
-balances = SANDBOX_INITIAL_BALANCES.copy()
-transfer_lock = asyncio.Lock()
 
 
 class LatestTransferResponse(BaseModel):
@@ -205,9 +209,14 @@ async def create_sandbox_transfer(
     mfa_required = transfer.amount >= HIGH_VALUE_TRANSFER_THRESHOLD
     verified = not mfa_required
     sca_state = "NOT_REQUIRED" if not mfa_required else "REQUIRED"
-    source_balance = balances.get(transfer.source_account_id)
-    destination_balance = balances.get(transfer.destination_account_id)
-    if source_balance is None or destination_balance is None:
+    try:
+        source_balance = await asyncio.to_thread(
+            get_sandbox_balance, transfer.source_account_id
+        )
+        await asyncio.to_thread(
+            get_sandbox_balance, transfer.destination_account_id
+        )
+    except SandboxAccountNotFound:
         await _record_transfer_status(
             start.transaction_id,
             authenticated_account_id,
@@ -217,6 +226,10 @@ async def create_sandbox_transfer(
             sca_state=sca_state,
         )
         raise HTTPException(status_code=404, detail="Sandbox account not found")
+    except SandboxBalanceStoreUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Sandbox balance store is unavailable"
+        ) from None
     if sandbox_account_status(transfer.source_account_id) != "ACTIVE":
         await _record_transfer_status(
             start.transaction_id,
@@ -230,13 +243,16 @@ async def create_sandbox_transfer(
             status_code=409,
             detail="ACCOUNT_FROZEN: This source account is frozen and cannot send transfers.",
         )
-    if source_balance < transfer.amount:
+    if source_balance.balance < transfer.amount:
         await _record_transfer_status(
             start.transaction_id, authenticated_account_id, idempotency_key, transfer, "FAILED"
         )
         raise HTTPException(
             status_code=409,
-            detail=f"INSUFFICIENT_FUNDS: Available balance is {SANDBOX_CURRENCY} {source_balance:.2f}.",
+            detail=(
+                f"INSUFFICIENT_FUNDS: Available balance is {source_balance.currency} "
+                f"{source_balance.balance:.2f}."
+            ),
         )
 
     if mfa_required and not transfer.otp_code:
@@ -325,38 +341,48 @@ async def create_sandbox_transfer(
             ),
         )
 
-    async with transfer_lock:
-        source_balance = balances.get(transfer.source_account_id)
-        destination_balance = balances.get(transfer.destination_account_id)
-        if source_balance is None or destination_balance is None:
-            await _record_transfer_status(
-                start.transaction_id, authenticated_account_id, idempotency_key, transfer, "FAILED"
-            )
-            raise HTTPException(status_code=404, detail="Sandbox account not found")
-        if source_balance < transfer.amount:
-            await _record_transfer_status(
-                start.transaction_id, authenticated_account_id, idempotency_key, transfer, "FAILED"
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=f"INSUFFICIENT_FUNDS: Available balance is {SANDBOX_CURRENCY} {source_balance:.2f}.",
-            )
-
-        balances[transfer.source_account_id] -= transfer.amount
-        balances[transfer.destination_account_id] += transfer.amount
-        try:
-            await _record_transfer_status(
-                start.transaction_id,
-                authenticated_account_id,
-                idempotency_key,
-                transfer,
-                "SUCCESS",
-                sca_state=sca_state,
-            )
-        except HTTPException:
-            balances[transfer.source_account_id] += transfer.amount
-            balances[transfer.destination_account_id] -= transfer.amount
-            raise
+    try:
+        await asyncio.to_thread(
+            execute_sandbox_transfer,
+            transaction_id=start.transaction_id,
+            account_id=authenticated_account_id,
+            idempotency_key=idempotency_key,
+            source_account_id=transfer.source_account_id,
+            destination_account_id=transfer.destination_account_id,
+            amount=transfer.amount,
+            currency=transfer.currency,
+            sca_state=sca_state,
+        )
+    except SandboxInsufficientFunds as error:
+        await _record_transfer_status(
+            start.transaction_id,
+            authenticated_account_id,
+            idempotency_key,
+            transfer,
+            "FAILED",
+            sca_state=sca_state,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"INSUFFICIENT_FUNDS: Available balance is {transfer.currency} "
+                f"{error.available_balance:.2f}."
+            ),
+        ) from None
+    except SandboxAccountNotFound:
+        await _record_transfer_status(
+            start.transaction_id,
+            authenticated_account_id,
+            idempotency_key,
+            transfer,
+            "FAILED",
+            sca_state=sca_state,
+        )
+        raise HTTPException(status_code=404, detail="Sandbox account not found") from None
+    except SandboxBalanceStoreUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Sandbox balance store is unavailable"
+        ) from None
     return SandboxTransferResponse(
         transaction_id=start.transaction_id,
         status="SUCCESS",

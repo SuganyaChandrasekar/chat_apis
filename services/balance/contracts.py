@@ -9,6 +9,7 @@ class AuthenticatedCustomer:
     """Customer identity established by a trusted authentication adapter."""
 
     subject: str
+    account_id: str | None = None
 
 
 BalanceT = TypeVar("BalanceT")

@@ -1,3 +1,5 @@
+import asyncio
+import os
 from datetime import date
 from typing import Any
 
@@ -15,14 +17,17 @@ from services.balance.contracts import (
 from services.sandbox import (
     SANDBOX_ACCOUNT_LABELS,
     SANDBOX_CUSTOMER_ACCOUNTS,
-    SANDBOX_CURRENCY,
-    SANDBOX_INITIAL_BALANCES,
     SandboxAccount,
     SandboxBalance,
     SandboxTransaction,
     SANDBOX_TRANSACTIONS,
     require_sandbox_mode,
     sandbox_account_status,
+)
+from services.sandbox_balance_store import (
+    SandboxAccountNotFound,
+    SandboxBalanceStoreUnavailable,
+    get_sandbox_balance as read_sandbox_balance,
 )
 
 app = FastAPI(title="Balance Service", version="0.1.0")
@@ -54,6 +59,28 @@ async def get_balance(
     customer: AuthenticatedCustomer = Depends(get_authenticated_customer),
     provider: BalanceProvider[Any] = Depends(get_balance_provider),
 ) -> Any:
+    if os.getenv("SANDBOX_MODE", "false").lower() == "true":
+        account_id = customer.account_id
+        if account_id is None or account_id not in SANDBOX_CUSTOMER_ACCOUNTS.get(
+            customer.subject, ()
+        ):
+            raise HTTPException(
+                status_code=403, detail="Account access is not authorized"
+            )
+        try:
+            balance = await asyncio.to_thread(read_sandbox_balance, account_id)
+        except SandboxAccountNotFound:
+            raise HTTPException(status_code=404, detail="Sandbox account not found")
+        except SandboxBalanceStoreUnavailable:
+            raise HTTPException(
+                status_code=503, detail="Sandbox balance store is unavailable"
+            ) from None
+        return SandboxBalance(
+            account_id=balance.account_id,
+            balance=balance.balance,
+            currency=balance.currency,
+        )
+
     try:
         return await provider.get_balance(customer)
     except BalanceIntegrationUnavailable:
@@ -75,11 +102,18 @@ async def get_sandbox_balance(
     authorized_accounts = SANDBOX_CUSTOMER_ACCOUNTS.get(authenticated_account_id, ())
     if account_id not in authorized_accounts:
         raise HTTPException(status_code=403, detail="Account access is not authorized")
-    balance = SANDBOX_INITIAL_BALANCES.get(account_id)
-    if balance is None:
+    try:
+        balance = await asyncio.to_thread(read_sandbox_balance, account_id)
+    except SandboxAccountNotFound:
         raise HTTPException(status_code=404, detail="Sandbox account not found")
+    except SandboxBalanceStoreUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Sandbox balance store is unavailable"
+        ) from None
     return SandboxBalance(
-        account_id=account_id, balance=balance, currency=SANDBOX_CURRENCY
+        account_id=balance.account_id,
+        balance=balance.balance,
+        currency=balance.currency,
     )
 
 

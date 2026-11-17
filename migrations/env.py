@@ -8,6 +8,7 @@ from services.cards.store import CardBase
 from services.capabilities.store import CapabilityBase
 from services.fraud.store import FraudBase
 from services.security.audit import DecisionTraceEvent, SecurityAuditEvent
+from services.sandbox_balance_store import SandboxBalanceBase
 from services.transfer.audit import AuditBase
 
 
@@ -28,6 +29,7 @@ target_metadata = [
     CardBase.metadata,
     CapabilityBase.metadata,
     FraudBase.metadata,
+    SandboxBalanceBase.metadata,
 ]
 
 

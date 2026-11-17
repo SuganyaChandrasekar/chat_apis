@@ -7,6 +7,8 @@ import httpx
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 from uuid import uuid4
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
@@ -33,7 +35,23 @@ from services.orchestrator.main import (
     get_balance_service_client,
 )
 from services.transfer import main as transfer_service
-from services.transfer.audit import TransferStart
+from services.sandbox_balance_store import (
+    SandboxBalanceBase,
+    get_sandbox_balance,
+)
+from services.transfer import audit as transfer_audit
+from services.transfer.audit import TransferAuditEvent, TransferStart
+
+
+@pytest.fixture(autouse=True)
+def sandbox_balance_database(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'sandbox.db'}")
+    SandboxBalanceBase.metadata.create_all(engine)
+    TransferAuditEvent.__table__.create(engine)
+    monkeypatch.setattr("services.sandbox_balance_store._engine", lambda: engine)
+    monkeypatch.setattr(transfer_audit, "_engine", lambda: engine)
+    yield engine
+    engine.dispose()
 
 
 async def _allow_advice_boundary(*args, **kwargs):
@@ -104,6 +122,58 @@ def test_balance_service_passes_through_test_provider_payload() -> None:
 
     assert response.status_code == 200
     assert response.json() == mock_payload
+
+
+def test_sandbox_balance_route_uses_authenticated_account_context(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SANDBOX_MODE", "true")
+    customer = BalanceCustomer(
+        subject="sandbox-checking-001",
+        account_id="sandbox-savings-001",
+    )
+
+    class Provider:
+        async def get_balance(self, requested_customer: BalanceCustomer) -> object:
+            raise AssertionError("Sandbox requests must use the shared balance store")
+
+    balance_app.dependency_overrides[get_balance_customer] = lambda: customer
+    balance_app.dependency_overrides[get_balance_provider] = Provider
+    try:
+        response = TestClient(balance_app).get("/balance")
+    finally:
+        balance_app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "account_id": "sandbox-savings-001",
+        "balance": "3200.00",
+        "currency": "USD",
+    }
+
+
+@pytest.mark.parametrize(
+    "customer",
+    [
+        BalanceCustomer(subject="sandbox-checking-001"),
+        BalanceCustomer(
+            subject="sandbox-checking-001",
+            account_id="sandbox-unauthorized-001",
+        ),
+    ],
+)
+def test_sandbox_balance_route_requires_authorized_account_context(
+    monkeypatch, customer: BalanceCustomer
+) -> None:
+    monkeypatch.setenv("SANDBOX_MODE", "true")
+    balance_app.dependency_overrides[get_balance_customer] = lambda: customer
+    try:
+        response = TestClient(balance_app).get("/balance")
+    finally:
+        balance_app.dependency_overrides.clear()
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Account access is not authorized"}
 
 
 def test_balance_service_fails_closed_without_data_provider() -> None:
@@ -327,9 +397,6 @@ def test_transfer_rejects_unverified_otp_without_mutating_balance(monkeypatch) -
     monkeypatch.setenv("SANDBOX_MODE", "true")
     monkeypatch.setenv("JWT_SECRET", secret)
     monkeypatch.setattr(
-        transfer_service, "balances", sandbox.SANDBOX_INITIAL_BALANCES.copy()
-    )
-    monkeypatch.setattr(
         transfer_service,
         "begin_transfer",
         lambda **kwargs: TransferStart("failed-otp-transaction", "PENDING_VALIDATION", False),
@@ -390,16 +457,13 @@ def test_transfer_rejects_unverified_otp_without_mutating_balance(monkeypatch) -
         )
     }
     assert audit_events == ["FAILED"]
-    assert transfer_service.balances["sandbox-checking-001"] == Decimal("1500.00")
+    assert get_sandbox_balance("sandbox-checking-001").balance == Decimal("1500.00")
 
 
 def test_sandbox_transfer_returns_unique_ids_and_checks_funds(monkeypatch) -> None:
     secret = "test-secret-key-with-at-least-32-bytes"
     monkeypatch.setenv("SANDBOX_MODE", "true")
     monkeypatch.setenv("JWT_SECRET", secret)
-    monkeypatch.setattr(
-        transfer_service, "balances", sandbox.SANDBOX_INITIAL_BALANCES.copy()
-    )
     transaction_ids = iter(["transaction-one", "transaction-two", "transaction-three"])
     audit_events = []
 
@@ -477,8 +541,75 @@ def test_sandbox_transfer_returns_unique_ids_and_checks_funds(monkeypatch) -> No
     assert insufficient.json() == {
         "detail": "INSUFFICIENT_FUNDS: Available balance is USD 1480.00."
     }
-    assert audit_events == ["SUCCESS", "SUCCESS", "FAILED"]
-    assert transfer_service.balances["sandbox-checking-001"] == Decimal("1480.00")
+    assert audit_events == ["FAILED"]
+    with Session(transfer_audit._engine()) as session:
+        successful_events = (
+            session.query(TransferAuditEvent)
+            .filter_by(status="SUCCESS")
+            .order_by(TransferAuditEvent.created_at)
+            .all()
+        )
+    assert [event.transaction_id for event in successful_events] == [
+        "transaction-one",
+        "transaction-two",
+    ]
+    assert get_sandbox_balance("sandbox-checking-001").balance == Decimal("1480.00")
+    assert get_sandbox_balance("sandbox-savings-001").balance == Decimal("3220.00")
+
+
+def test_transfer_updates_balances_returned_by_balance_service_after_restart(
+    monkeypatch, sandbox_balance_database, tmp_path
+) -> None:
+    monkeypatch.setenv("SANDBOX_MODE", "true")
+    monkeypatch.setenv("JWT_SECRET", "test-secret-key-with-at-least-32-bytes")
+    token = _sandbox_access_token(monkeypatch)
+    transfer_response = TestClient(transfer_service.app).post(
+        "/transfer",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": "persistent-balance-transfer",
+        },
+        json={
+            "source_account_id": "sandbox-savings-001",
+            "destination_account_id": "sandbox-checking-001",
+            "amount": "10.00",
+            "currency": "USD",
+            "confirmed": True,
+        },
+    )
+
+    assert transfer_response.status_code == 200
+    assert transfer_response.json()["status"] == "SUCCESS"
+    with Session(sandbox_balance_database) as session:
+        success_event = session.query(TransferAuditEvent).filter_by(
+            transaction_id=transfer_response.json()["transaction_id"],
+            status="SUCCESS",
+        ).one()
+    assert success_event.amount == Decimal("10.00")
+
+    sandbox_balance_database.dispose()
+    restarted_store_engine = create_engine(
+        f"sqlite:///{tmp_path / 'sandbox.db'}"
+    )
+    monkeypatch.setattr(
+        "services.sandbox_balance_store._engine",
+        lambda: restarted_store_engine,
+    )
+
+    client = TestClient(balance_app)
+    headers = {"Authorization": f"Bearer {token}"}
+    savings_response = client.get(
+        "/sandbox/balances/sandbox-savings-001", headers=headers
+    )
+    checking_response = client.get(
+        "/sandbox/balances/sandbox-checking-001", headers=headers
+    )
+
+    assert savings_response.status_code == 200
+    assert savings_response.json()["balance"] == "3190.00"
+    assert checking_response.status_code == 200
+    assert checking_response.json()["balance"] == "1510.00"
+    restarted_store_engine.dispose()
 
 
 def test_chat_sse_requires_a_valid_bearer_token(monkeypatch) -> None:

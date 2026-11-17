@@ -532,6 +532,119 @@ def test_affirmative_after_balance_offer_opens_balance_account_options(monkeypat
     assert rails.options[0] == {"rail_types": [RailType.INPUT]}
 
 
+def test_multi_account_balance_request_returns_each_authorized_balance(monkeypatch):
+    async def allow_advice_boundary(*args, **kwargs):
+        return {
+            "is_blocked": False,
+            "category": "allow",
+            "reason": "Not investment advice.",
+            "refusal_message": guardrails.REFUSAL_MESSAGE,
+        }
+
+    async def allow_input(rails, content, user_id, request_path="/chat", context=()):
+        return content
+
+    async def no_trace(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(orchestrator_main, "sanitize_content", lambda content: content)
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", allow_advice_boundary
+    )
+    monkeypatch.setattr(orchestrator_main, "check_input", allow_input)
+    monkeypatch.setattr(orchestrator_main, "_trace_decision", no_trace)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier(
+            "balance_check",
+            account_hints=["Checking", "Savings"],
+        ),
+    )
+
+    accounts = [
+        {"account_id": "checking-001", "label": "Checking account"},
+        {"account_id": "savings-001", "label": "Savings account"},
+        {"account_id": "investment-001", "label": "Investment account"},
+    ]
+    balances = {
+        "checking-001": {
+            "kind": "balance",
+            "account_id": "checking-001",
+            "balance": 1500.0,
+            "currency": "USD",
+        },
+        "savings-001": {
+            "kind": "balance",
+            "account_id": "savings-001",
+            "balance": 3200.0,
+            "currency": "USD",
+        },
+        "investment-001": {
+            "kind": "balance",
+            "account_id": "investment-001",
+            "balance": 5000.0,
+            "currency": "USD",
+        },
+    }
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        requested_urls = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, headers):
+            assert headers["Authorization"].startswith("Bearer ")
+            self.requested_urls.append(url)
+            if url.endswith("/sandbox/accounts"):
+                return FakeResponse(accounts)
+            account_id = url.rsplit("/", 1)[-1]
+            return FakeResponse(balances[account_id])
+
+    monkeypatch.setattr(
+        orchestrator_main.httpx, "AsyncClient", lambda timeout: FakeClient()
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_response(
+                "token",
+                "account-123",
+                "Show me the balances for both accounts",
+                guardrails=object(),
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    financial_events = [event for event in events if event["type"] == "financial"]
+    assert [event["payload"]["account_label"] for event in financial_events] == [
+        "Checking account",
+        "Savings account",
+    ]
+    assert [event["payload"]["balance"] for event in financial_events] == [
+        1500.0,
+        3200.0,
+    ]
+    assert not any("investment-001" in url for url in FakeClient.requested_urls)
+    assert events[-1]["type"] == "completion"
+
+
 def test_affirmative_without_immediate_balance_offer_is_not_overridden(monkeypatch):
     monkeypatch.setattr(guardrails, "append_audit_event", lambda event: None)
     rails = FakeRails(
@@ -746,7 +859,18 @@ def test_last_transfer_question_reads_authenticated_transfer_service(monkeypatch
     observed_input_context = []
     observed_output_context = []
     prior_messages = [
-        orchestrator_main.HumanMessage(content="Transfer 500 from Checking to Savings")
+        orchestrator_main.AIMessage(
+            content=(
+                "Transfer details: 10.00 USD from Savings account to Checking "
+                "account. Status: PENDING_CONFIRMATION."
+            )
+        ),
+        orchestrator_main.AIMessage(
+            content=(
+                "Transfer submitted. Reference: tx-123. "
+                "10.00 USD from Savings account to Checking account."
+            )
+        ),
     ]
     monkeypatch.setenv("TRANSFER_SERVICE_URL", "http://transfer.test")
 
@@ -779,8 +903,8 @@ def test_last_transfer_question_reads_authenticated_transfer_service(monkeypatch
                     200,
                     request=httpx.Request("GET", url),
                     json={
-                        "source_account_id": "checking-001",
-                        "destination_account_id": "savings-001",
+                        "source_account_id": "savings-001",
+                        "destination_account_id": "checking-001",
                     },
                 )
             assert url == "http://localhost:8001/sandbox/accounts"
@@ -804,7 +928,7 @@ def test_last_transfer_question_reads_authenticated_transfer_service(monkeypatch
             async for event in orchestrator_main._stream_response(
                 "token",
                 "account-123",
-                "How much was my last transfer?",
+                "From which account did I make the transfer?",
                 guardrails=object(),
                 prior_messages=prior_messages,
             )
@@ -812,14 +936,29 @@ def test_last_transfer_question_reads_authenticated_transfer_service(monkeypatch
 
     events = asyncio.run(collect_events())
 
-    assert events[0]["content"] == "It was transferred from Checking to Savings."
+    assert events[0]["content"] == (
+        "Your transfer was completed from Savings to Checking."
+    )
     assert events[-1] == {"type": "completion"}
     assert observed_input_context == [
-        {"role": "user", "content": "Transfer 500 from Checking to Savings"}
+        {
+            "role": "assistant",
+            "content": (
+                "Transfer details: 10.00 USD from Savings account to Checking "
+                "account. Status: PENDING_CONFIRMATION."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "Transfer submitted. Reference: tx-123. "
+                "10.00 USD from Savings account to Checking account."
+            ),
+        },
     ]
     assert observed_output_context == [
-        {"role": "user", "content": "Transfer 500 from Checking to Savings"},
-        {"role": "user", "content": "How much was my last transfer?"},
+        *observed_input_context,
+        {"role": "user", "content": "From which account did I make the transfer?"},
     ]
 
 
@@ -1036,6 +1175,69 @@ def test_displayed_balance_amount_is_persisted_until_session_expiry(monkeypatch)
     )
 
 
+def test_all_displayed_balances_are_persisted_for_followup_context(monkeypatch):
+    class FakeStore:
+        messages = []
+
+        async def load(self, thread_id):
+            return []
+
+        async def append(self, thread_id, messages):
+            self.messages.extend(messages)
+
+    store = FakeStore()
+
+    async def fake_stream_response(
+        token,
+        account_id,
+        content,
+        cache=None,
+        account_choice=None,
+        guardrails=None,
+        request_path="/chat",
+        prior_messages=None,
+        turn_messages=None,
+    ):
+        turn_messages.append(orchestrator_main.HumanMessage(content=content))
+        for account_id, label, amount in (
+            ("checking-001", "Checking account", 1500.0),
+            ("savings-001", "Savings account", 3200.0),
+        ):
+            yield {
+                "type": "financial",
+                "payload": {
+                    "kind": "balance",
+                    "account_id": account_id,
+                    "balance": amount,
+                    "currency": "USD",
+                    "account_label": label,
+                },
+            }
+        yield {"type": "completion"}
+
+    monkeypatch.setattr(orchestrator_main, "_stream_response", fake_stream_response)
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_persisted_response(
+                store=store,
+                thread_id=orchestrator_main.UUID(int=1),
+                token="token",
+                account_id="account-123",
+                content="Show me both account balances",
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert len([event for event in events if event["type"] == "financial"]) == 2
+    assert store.messages[-1].content == (
+        "Earlier balance check for Checking account: USD 1,500.00.\n"
+        "Earlier balance check for Savings account: USD 3,200.00."
+    )
+
+
 def test_exact_balance_followup_uses_recent_stored_amount(monkeypatch):
     monkeypatch.setattr(
         orchestrator_main,
@@ -1094,6 +1296,288 @@ def test_exact_balance_followup_uses_recent_stored_amount(monkeypatch):
         },
         {"type": "completion"},
     ]
+
+
+def test_transfer_recall_followup_reaches_agent_with_conversation_context(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
+    captured_state = {}
+    prior_messages = [
+        orchestrator_main.AIMessage(
+            content=(
+                "Transfer submitted. Reference: tx-123. "
+                "10.00 USD from Checking account to Savings account."
+            )
+        ),
+    ]
+
+    async def passthrough_check(
+        rails, content, user_id, request_path="/chat", context=()
+    ):
+        return content
+
+    async def fake_stream_agent_events(graph, state):
+        captured_state.update(state)
+        yield {
+            "type": "content",
+            "content": "We transferred it to your Savings account.",
+        }
+        yield {"type": "completion"}
+
+    monkeypatch.setattr(orchestrator_main, "sanitize_content", lambda content: content)
+    monkeypatch.setattr(orchestrator_main, "check_input", passthrough_check)
+    monkeypatch.setattr(orchestrator_main, "check_output", passthrough_check)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "build_agent_graph",
+        lambda token, account_id: object(),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "stream_agent_events", fake_stream_agent_events
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_response(
+                "token",
+                "account-123",
+                "To which account did we transfer?",
+                guardrails=object(),
+                prior_messages=prior_messages,
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        {"type": "content", "content": "We transferred it to your Savings account."},
+        {"type": "completion"},
+    ]
+    assert captured_state["account_id"] == "account-123"
+    assert [message.content for message in captured_state["messages"][-2:]] == [
+        (
+            "Transfer submitted. Reference: tx-123. "
+            "10.00 USD from Checking account to Savings account."
+        ),
+        "To which account did we transfer?",
+    ]
+
+
+def test_transfer_history_failure_falls_back_to_conversation_context(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier("transfer_history"),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
+    monkeypatch.setenv("TRANSFER_SERVICE_URL", "http://transfer.test")
+    prior_messages = [
+        orchestrator_main.AIMessage(
+            content=(
+                "Transfer details: 10.00 USD from Checking account to "
+                "Savings account. Status: PENDING_CONFIRMATION."
+            )
+        )
+    ]
+    captured_state = {}
+
+    async def passthrough_check(
+        rails, content, user_id, request_path="/chat", context=()
+    ):
+        return content
+
+    class FailedTransferClient:
+        def __init__(self, timeout):
+            assert timeout == 5.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exception_type, exception, traceback):
+            return False
+
+        async def get(self, url, headers):
+            raise httpx.ConnectError("transfer service unavailable")
+
+    async def fake_stream_agent_events(graph, state):
+        captured_state.update(state)
+        yield {
+            "type": "content",
+            "content": (
+                "The conversation shows a 10.00 USD transfer from Checking "
+                "to Savings, pending confirmation."
+            ),
+        }
+        yield {"type": "completion"}
+
+    monkeypatch.setattr(orchestrator_main, "sanitize_content", lambda content: content)
+    monkeypatch.setattr(orchestrator_main, "check_input", passthrough_check)
+    monkeypatch.setattr(orchestrator_main, "check_output", passthrough_check)
+    monkeypatch.setattr(
+        orchestrator_main.httpx, "AsyncClient", FailedTransferClient
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "build_agent_graph", lambda token, account_id: object()
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "stream_agent_events", fake_stream_agent_events
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_response(
+                "token",
+                "account-123",
+                "To which account did I make the transfer?",
+                guardrails=object(),
+                prior_messages=prior_messages,
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        {
+            "type": "content",
+            "content": (
+                "The conversation shows a 10.00 USD transfer from Checking "
+                "to Savings, pending confirmation."
+            ),
+        },
+        {"type": "completion"},
+    ]
+    assert captured_state["account_id"] == "account-123"
+    assert captured_state["intent"] == "transfer_history"
+    assert captured_state["messages"][-2].content == prior_messages[0].content
+    assert captured_state["messages"][-1].content == (
+        "To which account did I make the transfer?"
+    )
+
+
+def test_transfer_event_details_are_saved_for_followup_context(monkeypatch):
+    class FakeStore:
+        messages = []
+
+        async def load(self, thread_id):
+            return []
+
+        async def append(self, thread_id, messages):
+            self.messages.extend(messages)
+
+    store = FakeStore()
+
+    async def fake_stream_response(
+        token,
+        account_id,
+        content,
+        cache=None,
+        account_choice=None,
+        guardrails=None,
+        request_path="/chat",
+        prior_messages=None,
+        turn_messages=None,
+    ):
+        turn_messages.append(orchestrator_main.HumanMessage(content=content))
+        yield {
+            "type": "transfer",
+            "status": "PENDING_CONFIRMATION",
+            "transfer": {
+                "amount": "10.00",
+                "currency": "USD",
+                "source_account": "Checking account",
+                "recipient": "Savings account",
+            },
+        }
+        yield {"type": "completion"}
+
+    monkeypatch.setattr(orchestrator_main, "_stream_response", fake_stream_response)
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_persisted_response(
+                store=store,
+                thread_id=orchestrator_main.UUID(int=1),
+                token="token",
+                account_id="account-123",
+                content="Prepare a transfer",
+            )
+        ]
+
+    asyncio.run(collect_events())
+
+    assert store.messages[-1].content == (
+        "Transfer preview prepared: 10.00 USD from Checking account to Savings "
+        "account. This preview does not establish the transfer's final execution "
+        "status."
+    )
+
+
+def test_transfer_request_with_unresolved_account_hints_reaches_agent(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_classify_chat_intent",
+        _intent_classifier("transfer_request", amount=10),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "check_advice_boundary", _allow_advice_boundary
+    )
+    captured_state = {}
+
+    async def passthrough_check(
+        rails, content, user_id, request_path="/chat", context=()
+    ):
+        return content
+
+    async def fake_stream_agent_events(graph, state):
+        captured_state.update(state)
+        yield {
+            "type": "content",
+            "content": "Which linked account should receive the transfer?",
+        }
+        yield {"type": "completion"}
+
+    monkeypatch.setattr(orchestrator_main, "sanitize_content", lambda content: content)
+    monkeypatch.setattr(orchestrator_main, "check_input", passthrough_check)
+    monkeypatch.setattr(orchestrator_main, "check_output", passthrough_check)
+    monkeypatch.setattr(
+        orchestrator_main, "build_agent_graph", lambda token, account_id: object()
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "stream_agent_events", fake_stream_agent_events
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in orchestrator_main._stream_response(
+                "token",
+                "account-123",
+                "transfer 10 from checking savings",
+                guardrails=object(),
+            )
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        {
+            "type": "content",
+            "content": "Which linked account should receive the transfer?",
+        },
+        {"type": "completion"},
+    ]
+    assert captured_state["intent"] == "transfer_request"
+    assert captured_state["account_id"] == "account-123"
+    assert captured_state["authorization_scope"] == "transfer:prepare"
+    assert captured_state["messages"][-1].content == (
+        "transfer 10 from checking savings"
+    )
 
 
 def test_balance_recall_after_expiry_uses_contextual_agent_not_balance_picker(
@@ -1412,6 +1896,101 @@ def test_chat_intent_classifier_extracts_contextual_entities():
     assert result.amount == 500
     assert result.account_hint == "Savings"
     assert json.dumps(context) in rails.prompts[0]
+
+
+def test_chat_intent_classifier_extracts_semantic_multi_account_hints():
+    class IntentRails:
+        prompts = []
+
+        async def generate_async(self, prompt, options):
+            self.prompts.append(prompt)
+            return (
+                '{"intent":"balance_check","confidence":0.95,'
+                '"account_hints":["Checking","Savings"]}'
+            )
+
+    rails = IntentRails()
+    result = asyncio.run(
+        _REAL_CLASSIFY_CHAT_INTENT(
+            rails,
+            "Show me the checking and savings balances",
+            [],
+        )
+    )
+
+    assert result.intent == "balance_check"
+    assert result.account_hints == ["Checking", "Savings"]
+    assert "semantically asks for all linked accounts" in rails.prompts[0]
+    assert "account_hints" in rails.prompts[0]
+
+
+def test_chat_intent_classifier_routes_transfer_recall_to_transfer_history():
+    class IntentRails:
+        prompts = []
+
+        async def generate_async(self, prompt, options):
+            self.prompts.append(prompt)
+            return '{"intent":"transfer_history","confidence":0.95}'
+
+    rails = IntentRails()
+    context = [
+        {
+            "role": "assistant",
+            "content": (
+                "Transfer submitted. Reference: tx-123. "
+                "10.00 USD from Checking account to Savings account."
+            ),
+        }
+    ]
+    question = "To which account did we transfer?"
+
+    result = asyncio.run(_REAL_CLASSIFY_CHAT_INTENT(rails, question, context))
+
+    assert result.intent == "transfer_history"
+    assert "whenever the user asks about a prior transfer's" in rails.prompts[0]
+    assert "rather than treating an old preparation preview as the final outcome" in (
+        rails.prompts[0]
+    )
+    assert json.dumps(context) in rails.prompts[0]
+    assert f"Latest user message: {json.dumps(question)}" in rails.prompts[0]
+
+
+def test_chat_intent_classifier_allows_semantic_transfer_clarification():
+    class IntentRails:
+        prompts = []
+
+        async def generate_async(self, prompt, options):
+            self.prompts.append(prompt)
+            return (
+                '{"intent":"transfer_request","confidence":0.92,'
+                '"amount":"10.00","source_account_hint":null,'
+                '"destination_account_hint":null}'
+            )
+
+    rails = IntentRails()
+    result = asyncio.run(
+        _REAL_CLASSIFY_CHAT_INTENT(
+            rails,
+            "transfer 10 from checking savings",
+            [
+                {
+                    "role": "assistant",
+                    "content": "Your savings account balance is USD 3,200.00.",
+                }
+            ],
+        )
+    )
+
+    assert result.intent == "transfer_request"
+    assert result.amount == 10
+    assert result.source_account_hint is None
+    assert result.destination_account_hint is None
+    assert "Classify requests to create or prepare a transfer as transfer_request" in (
+        rails.prompts[0]
+    )
+    assert "leave unclear details empty so the orchestrator can ask for clarification" in (
+        rails.prompts[0]
+    )
 
 
 def test_chat_intent_classifier_fails_closed_on_invalid_output():

@@ -130,6 +130,8 @@ _SANDBOX_CRISIS_CONTACT_DEFAULT = (
 class ChatIntentClassification(BaseModel):
     intent: str = Field(min_length=1, max_length=64)
     confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    all_accounts: bool = False
+    account_hints: list[str] = Field(default_factory=list, max_length=10)
     workflow: str | None = Field(default=None, max_length=128)
     capability: str | None = Field(default=None, max_length=128)
     amount: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
@@ -847,6 +849,10 @@ async def _classify_chat_intent(
         "description of the classified banking task; create a specific intent "
         "label if the request does not fit an existing task), "
         "confidence (a number from 0 to 1 reflecting classification certainty), "
+        "all_accounts (true only when the user requests balance information for "
+        "all linked accounts; otherwise false), account_hints (a list of linked "
+        "account labels or types semantically identified as requested; empty when "
+        "none are specified), "
         "workflow (a concise, broad semantic category for the task), capability "
         "(a concise semantic description of the specific capability; use a stable "
         "snake_case label where possible), "
@@ -866,7 +872,10 @@ async def _classify_chat_intent(
         "an unexpired prior assistant balance response; otherwise null. Do not "
         "invent entities. A personal recommendation about buying an asset is not "
         "a balance_check or balance_sufficiency request; classify it as other. "
-        "A general current balance lookup is balance_check. If the latest user "
+        "A general current balance lookup is balance_check. When the request "
+        "semantically asks for all linked accounts, set all_accounts true. When it "
+        "asks for a specified subset of multiple accounts, return those account "
+        "labels or types in account_hints. If the latest user "
         "message names an account after the assistant asked which linked account "
         "to check, classify it as balance_check and return that account_hint. "
         "If the latest message confirms a prior assistant offer to check a current "
@@ -877,8 +886,18 @@ async def _classify_chat_intent(
         "current balance is enough for a specific transfer amount is "
         "balance_sufficiency. Asking what balance was previously shown is "
         "balance_history. Asking for an account number is account_number. "
-        "A request to create a transfer is transfer_request, and a request about "
-        "a previous transfer is transfer_history. A request to view a user's "
+        "Classify requests to create or prepare a transfer as transfer_request, "
+        "even when some details are missing. Extract source and destination account "
+        "hints only when their roles are clear from the request and conversation; "
+        "leave unclear details empty so the orchestrator can ask for clarification. "
+        "Use transfer_history whenever the user asks about a prior transfer's "
+        "source, destination, amount, or completion status, including when recent "
+        "conversation mentions a transfer or a prepared preview; this intent "
+        "verifies the completed transfer record rather than treating an old "
+        "preparation preview as the final outcome. For other details already "
+        "stated in the conversation, "
+        "classify as other so the LangGraph agent can use that context. A request "
+        "to view a user's "
         "recent purchases, deposits, or account transaction list is "
         "transaction_history; extract a requested count into limit, a linked "
         "account label into account_hint, a date period into date_hint, and a "
@@ -1342,15 +1361,21 @@ async def _stream_response(
     if intent.intent == "transfer_history":
         transfer_url = os.getenv("TRANSFER_SERVICE_URL", "http://localhost:8002")
         try:
+            answer = None
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
                     f"{transfer_url.rstrip('/')}/transfers/latest",
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 if response.status_code == 404:
-                    answer = (
-                        "I couldn't find a completed transfer for your account."
-                    )
+                    if prior_messages:
+                        logger.info(
+                            "No transfer record found; checking conversation context"
+                        )
+                    else:
+                        answer = (
+                            "I couldn't find a completed transfer for your account."
+                        )
                 else:
                     response.raise_for_status()
                     latest_transfer = LatestTransferPayload.model_validate(
@@ -1387,48 +1412,43 @@ async def _stream_response(
                     source_label = source_label.removesuffix(" account")
                     destination_label = destination_label.removesuffix(" account")
                     answer = (
-                        f"It was transferred from {source_label} to "
+                        f"Your transfer was completed from {source_label} to "
                         f"{destination_label}."
                     )
-            yield await _checked_output_event(
-                guardrails,
-                answer,
-                account_id,
-                request_path,
-                context=guardrail_turn_context,
+            if answer is not None:
+                yield await _checked_output_event(
+                    guardrails,
+                    answer,
+                    account_id,
+                    request_path,
+                    context=guardrail_turn_context,
+                )
+                yield {"type": "completion"}
+                return
+        except (httpx.RequestError, httpx.HTTPStatusError) as error:
+            if not prior_messages:
+                yield {
+                    "type": "error",
+                    "content": "Transfer information is currently unavailable.",
+                }
+                yield {"type": "completion"}
+                return
+            logger.warning(
+                "Transfer history lookup failed; checking conversation context (%s)",
+                type(error).__name__,
             )
-            yield {"type": "completion"}
-            return
-        except (httpx.RequestError, httpx.HTTPStatusError):
-            yield {
-                "type": "error",
-                "content": "Transfer information is currently unavailable.",
-            }
-            yield {"type": "completion"}
-            return
-        except (ValidationError, ValueError, TypeError):
-            yield {
-                "type": "error",
-                "content": "Transfer information is currently unavailable.",
-            }
-            yield {"type": "completion"}
-            return
-    elif intent.intent == "transfer_request":
-        if not intent.source_account_hint or not intent.destination_account_hint:
-            prompt = (
-                "Please specify both the source and recipient accounts. "
-                "For example: 'Transfer $10 from Checking account to Savings account.'"
+        except (ValidationError, ValueError, TypeError) as error:
+            if not prior_messages:
+                yield {
+                    "type": "error",
+                    "content": "Transfer information is currently unavailable.",
+                }
+                yield {"type": "completion"}
+                return
+            logger.warning(
+                "Transfer history response invalid; checking conversation context (%s)",
+                type(error).__name__,
             )
-            yield await _checked_output_event(
-                guardrails,
-                prompt,
-                account_id,
-                request_path,
-                context=guardrail_turn_context,
-            )
-            yield {"type": "completion"}
-            return
-
     if (
         (
             intent.intent == "balance_check"
@@ -1454,6 +1474,59 @@ async def _stream_response(
                     for account in accounts
                 ):
                     raise ValueError("Invalid account response")
+
+                selected_accounts = None
+                if intent.all_accounts and account_choice is None:
+                    selected_accounts = accounts
+                elif len(intent.account_hints) > 1 and account_choice is None:
+                    requested_indices = [
+                        _matching_account_index(account_hint, accounts)
+                        for account_hint in intent.account_hints
+                    ]
+                    if (
+                        all(index is not None for index in requested_indices)
+                        and len(set(requested_indices)) == len(requested_indices)
+                    ):
+                        selected_accounts = [
+                            accounts[index]
+                            for index in requested_indices
+                            if index is not None
+                        ]
+
+                if selected_accounts is not None:
+                    balance_urls = [
+                        f"{balance_url.rstrip('/')}/sandbox/balances/"
+                        f"{quote(account['account_id'], safe='')}"
+                        for account in selected_accounts
+                    ]
+                    balance_responses = await asyncio.gather(
+                        *(
+                            client.get(
+                                url,
+                                headers={"Authorization": f"Bearer {token}"},
+                            )
+                            for url in balance_urls
+                        )
+                    )
+                    balance_events = []
+                    for selected_account, balance_response in zip(
+                        selected_accounts, balance_responses, strict=True
+                    ):
+                        balance_response.raise_for_status()
+                        balance = BalanceFinancialPayload.model_validate(
+                            balance_response.json()
+                        )
+                        if balance.account_id != selected_account["account_id"]:
+                            raise ValueError("Mismatched account response")
+                        payload = balance.model_dump(mode="json")
+                        payload["account_label"] = selected_account["label"]
+                        balance_events.append(
+                            {"type": "financial", "payload": payload}
+                        )
+                    for balance_event in balance_events:
+                        yield balance_event
+                    yield {"type": "completion"}
+                    return
 
                 selected_index = account_choice
                 if selected_index is None and len(accounts) > 1:
@@ -1502,15 +1575,63 @@ async def _stream_response(
                 payload = balance.model_dump(mode="json")
                 payload["account_label"] = selected_account["label"]
                 yield {"type": "financial", "payload": payload}
-        except (httpx.RequestError, httpx.HTTPStatusError):
-            if account_choice is None:
+        except httpx.HTTPStatusError as error:
+            endpoint = (
+                "balance"
+                if error.request.url.path.startswith("/sandbox/balances/")
+                else "account-list"
+            )
+            logger.warning(
+                "Balance service %s request returned HTTP %s",
+                endpoint,
+                error.response.status_code,
+            )
+            if (
+                account_choice is None
+                and not intent.all_accounts
+                and len(intent.account_hints) <= 1
+            ):
                 pass
             else:
-                yield {"type": "error", "content": "Account information is currently unavailable."}
+                yield {
+                    "type": "error",
+                    "content": "Account information is currently unavailable.",
+                }
                 yield {"type": "completion"}
                 return
-        except (ValidationError, ValueError, TypeError, KeyError):
-            yield {"type": "error", "content": "Account information is currently unavailable."}
+        except httpx.RequestError as error:
+            endpoint = (
+                "balance"
+                if error.request.url.path.startswith("/sandbox/balances/")
+                else "account-list"
+            )
+            logger.warning(
+                "Balance service %s request failed (%s)",
+                endpoint,
+                type(error).__name__,
+            )
+            if (
+                account_choice is None
+                and not intent.all_accounts
+                and len(intent.account_hints) <= 1
+            ):
+                pass
+            else:
+                yield {
+                    "type": "error",
+                    "content": "Account information is currently unavailable.",
+                }
+                yield {"type": "completion"}
+                return
+        except (ValidationError, ValueError, TypeError, KeyError) as error:
+            logger.warning(
+                "Balance service response was invalid (%s)",
+                type(error).__name__,
+            )
+            yield {
+                "type": "error",
+                "content": "Account information is currently unavailable.",
+            }
             yield {"type": "completion"}
             return
         else:
@@ -1703,6 +1824,7 @@ async def _stream_persisted_response_impl(
     response_types = set()
     displayed_balance_account = None
     displayed_balance_context = None
+    displayed_balance_contexts = []
     completion_event = {"type": "completion"}
     async for event in _stream_response(
         token,
@@ -1740,6 +1862,7 @@ async def _stream_persisted_response_impl(
                             f"Earlier balance check for {displayed_balance_account}: "
                             f"{payload['currency']} {balance_amount:,.2f}."
                         )
+                        displayed_balance_contexts.append(displayed_balance_context)
         elif event.get("type") == "account_options":
             labels = [
                 account["label"]
@@ -1750,6 +1873,23 @@ async def _stream_persisted_response_impl(
                 assistant_content.append(
                     f"{event.get('content', '')} Available accounts: "
                     f"{', '.join(labels)}."
+                )
+        elif event.get("type") == "transfer":
+            transfer = event.get("transfer")
+            if isinstance(transfer, dict) and all(
+                isinstance(transfer.get(field), str)
+                for field in (
+                    "amount",
+                    "currency",
+                    "source_account",
+                    "recipient",
+                )
+            ):
+                assistant_content.append(
+                    f"Transfer preview prepared: {transfer['amount']} "
+                    f"{transfer['currency']} from {transfer['source_account']} "
+                    f"to {transfer['recipient']}. This preview does not establish "
+                    "the transfer's final execution status."
                 )
         yield event
 
@@ -1775,15 +1915,14 @@ async def _stream_persisted_response_impl(
 
     assistant_reply = "".join(assistant_content)
     if not assistant_reply and "financial" in response_types:
-        assistant_reply = (
-            displayed_balance_context
-            if displayed_balance_context
-            else (
-                f"I displayed the balance for {displayed_balance_account}."
-                if displayed_balance_account
-                else _GENERIC_BALANCE_REPLY
-            )
-        )
+        if len(displayed_balance_contexts) > 1:
+            assistant_reply = "\n".join(displayed_balance_contexts)
+        elif displayed_balance_context:
+            assistant_reply = displayed_balance_context
+        elif displayed_balance_account:
+            assistant_reply = f"I displayed the balance for {displayed_balance_account}."
+        else:
+            assistant_reply = _GENERIC_BALANCE_REPLY
     elif not assistant_reply and "transfer" in response_types:
         assistant_reply = "I prepared a transfer for your review; it has not been executed."
     if turn_messages and assistant_reply:
